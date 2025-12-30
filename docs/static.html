@@ -506,6 +506,7 @@
   const shardCache = new Map();
   const collapsedIds = new Set();
   const postsBySid = new Map();
+  let initialRoute = true;
 
   // -----------------------
   // Utilities
@@ -741,7 +742,13 @@
       ? parseISODateUTC(warpInput.value, false)
       : (currentReferenceTime || manifest?.snapshot_time || Math.floor(Date.now()/1000));
     if (!baseTs) return;
-    const nextTs = baseTs + deltaDays * 86400;
+    let clampedBase = baseTs;
+    if (timeRange.min && clampedBase < timeRange.min) clampedBase = timeRange.min;
+    if (timeRange.max && clampedBase > timeRange.max) clampedBase = timeRange.max;
+    if (clampedBase !== baseTs) {
+      setWarpInputs(formatISODateUTC(clampedBase));
+    }
+    const nextTs = clampedBase + deltaDays * 86400;
     if (timeRange.min && nextTs < timeRange.min) {
       alert("Sorry, this archive cannot yet infer the existence of HN before HN existed.");
       return;
@@ -1291,6 +1298,16 @@
         setStatus('');
         return;
       }
+      if ((warpDate || warpSid !== null) && (view !== 'news' || page > 1)) {
+        const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
+        const label = labelMap[view] || view;
+        const titled = label.charAt(0).toUpperCase() + label.slice(1);
+        if (initialRoute) {
+          nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
+          return;
+        }
+        holdStatus(view !== 'news' ? `No ${titled} for this day.` : 'No more items for this day.', 2000);
+      }
       if (listRetryKey !== retryKey) {
         listRetryKey = retryKey;
         listRetryCount = 0;
@@ -1308,18 +1325,20 @@
             listView(curView, curPage, curWarp, curWarpDate, token);
           }
         }, 250);
-        setStatus('Loading…');
+        if (warpDate || warpSid !== null) {
+          const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
+          const label = labelMap[view] || view;
+          const titled = label.charAt(0).toUpperCase() + label.slice(1);
+          holdStatus(view !== 'news' ? `No ${titled} for this day.` : 'No more items for this day.', 2000);
+        } else {
+          setStatus('Loading…');
+        }
         return;
       }
       if (warpDate || warpSid !== null) {
         const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
         const label = labelMap[view] || view;
         const titled = label.charAt(0).toUpperCase() + label.slice(1);
-        if (view !== 'news') {
-          holdStatus(`No ${titled} items for this day.`, 2000);
-          nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
-          return;
-        }
         const refSid = warpSid ?? findShardForTs(referenceTime)?.sid;
         if (refSid != null) {
           const fallback = findNextShardWithPosts(refSid);
@@ -1330,7 +1349,7 @@
             return;
           }
         }
-        holdStatus(`No ${titled} items for this day.`, 2000);
+        holdStatus(`No ${titled} for this day.`, 2000);
       }
       if (tableEl && tableEl.innerHTML && !tableEl.innerHTML.includes('Loading')) {
         return;
@@ -2088,7 +2107,7 @@
           <option value="users-fresh">Newest active users</option>
           <option value="users-gaps">Longest user spans</option>
           <option value="domains-users">Domains by unique users</option>
-          <option value="domains-loyal">Most loyal domains</option>
+          <option value="domains-loyal">Domains by total user posts</option>
           <option value="users-months">Monthly active users</option>
         </select>
         <div class="subtext" style="margin:10px 0 4px 0">Shard filter (optional)</div>
@@ -2176,11 +2195,11 @@
         mode: 'users'
       },
       'domains-loyal': {
-        sql: "SELECT username, domain, count FROM user_domains ORDER BY count DESC LIMIT 50",
+        sql: "SELECT domain, SUM(count) as posts FROM user_domains GROUP BY domain ORDER BY posts DESC LIMIT 50",
         mode: 'users'
       },
       'users-months': {
-        sql: "SELECT month, SUM(count) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 36",
+        sql: "SELECT month, COUNT(*) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 36",
         mode: 'users'
       }
     };
@@ -2321,13 +2340,14 @@
   async function renderUserView(username, token = 0) {
     setStatus('Loading user…');
     const uname = String(username || '').trim();
+    const unameKey = normalizeUser(uname);
     if (!uname) {
       tableEl.innerHTML = `<tr><td style="padding:14px" class="loading">User not found.</td></tr>`;
       setStatus('');
       return;
     }
 
-    const db = await loadUserStatsShard(uname);
+    const db = await loadUserStatsShard(unameKey);
     if (token && token !== routeToken) return;
     if (!db) {
       tableEl.innerHTML = `<tr><td style="padding:14px" class="loading">User stats not available.</td></tr>`;
@@ -2335,7 +2355,7 @@
       return;
     }
 
-    const user = sqlOne(db, `SELECT * FROM users WHERE username=? LIMIT 1`, [uname]);
+    const user = sqlOne(db, `SELECT * FROM users WHERE username=? COLLATE NOCASE LIMIT 1`, [unameKey]);
     if (!user) {
       tableEl.innerHTML = `<tr><td style="padding:14px" class="loading">User not found.</td></tr>`;
       setStatus('');
@@ -2344,13 +2364,13 @@
 
     const topDomains = sqlAll(db, `
       SELECT domain, count FROM user_domains
-      WHERE username=? ORDER BY count DESC, domain ASC LIMIT 8
-    `, [uname]);
+      WHERE username=? COLLATE NOCASE ORDER BY count DESC, domain ASC LIMIT 8
+    `, [unameKey]);
 
     const topMonths = sqlAll(db, `
       SELECT month, count FROM user_months
-      WHERE username=? ORDER BY count DESC, month DESC LIMIT 8
-    `, [uname]);
+      WHERE username=? COLLATE NOCASE ORDER BY count DESC, month DESC LIMIT 8
+    `, [unameKey]);
 
     const first = formatAbsoluteTime(user.first_time);
     const last = formatAbsoluteTime(user.last_time);
@@ -2449,6 +2469,7 @@
     if (view === 'item' && id) {
       currentThreadId = Number(id);
       await renderThread(Number(id), token);
+      initialRoute = false;
       return;
     }
 
@@ -2456,6 +2477,7 @@
       currentThreadId = null;
       clearResumeStates();
       await renderCommentView(Number(id), token);
+      initialRoute = false;
       return;
     }
 
@@ -2463,6 +2485,7 @@
       currentThreadId = null;
       clearResumeStates();
       await renderUserView(id, token);
+      initialRoute = false;
       return;
     }
 
@@ -2472,6 +2495,7 @@
       await renderArchiveView(token);
       if (token !== routeToken) return;
       history.replaceState({}, '', location.href);
+      initialRoute = false;
       return;
     }
 
@@ -2479,6 +2503,7 @@
       currentThreadId = null;
       clearResumeStates();
       await renderQueryView(token);
+      initialRoute = false;
       return;
     }
 
@@ -2486,10 +2511,12 @@
       currentThreadId = null;
       clearResumeStates();
       await listView(view, page, warp, warpDate, token);
+      initialRoute = false;
       return;
     }
 
     nav({ view:'news', p:1 });
+    initialRoute = false;
   }
 
   // -----------------------
@@ -2522,18 +2549,28 @@
 
         const totalItems = (manifest.shards || []).reduce((m, s) => m + (s.count || 0), 0);
         const totalBytes = (manifest.shards || []).reduce((m, s) => m + (s.bytes || 0), 0);
-        const totalRawBytes = (manifest.shards || []).reduce((m, s) => {
-          const raw = Number(s.raw_bytes_est);
-          return m + (Number.isFinite(raw) ? raw : 0);
-        }, 0);
+        const totals = (manifest.shards || []).reduce((acc, s) => {
+          const file = String(s.file || '');
+          const isGz = file.endsWith('.gz');
+          const bytes = Number(s.bytes) || 0;
+          const rawEst = Number(s.raw_bytes_est);
+          if (isGz) acc.gz += bytes;
+          else acc.raw += bytes;
+          if (Number.isFinite(rawEst)) acc.rawEst += rawEst;
+          return acc;
+        }, { raw: 0, gz: 0, rawEst: 0 });
         const tmin = (manifest.shards || []).reduce((m, s) => Math.min(m, s.tmin || m), Number.POSITIVE_INFINITY);
         const tmax = (manifest.shards || []).reduce((m, s) => Math.max(m, s.tmax || 0), 0);
         if (Number.isFinite(tmin) && tmax) {
           const start = formatDateShort(tmin);
           const end = formatDateShort(tmax);
           const gb = (totalBytes / (1024 ** 3)).toFixed(1);
-          const rawGb = totalRawBytes > 0 ? (totalRawBytes / (1024 ** 3)).toFixed(1) : null;
-          const sizeLabel = rawGb ? `${rawGb}GB raw (${gb}GB gz)` : `${gb}GB`;
+          const rawBytes = Math.max(totals.rawEst, totals.raw);
+          const rawGb = rawBytes > 0 ? (rawBytes / (1024 ** 3)).toFixed(1) : null;
+          const gzGb = totals.gz > 0 ? (totals.gz / (1024 ** 3)).toFixed(1) : null;
+          const sizeLabel = rawGb && gzGb
+            ? `${rawGb}GB raw (${gzGb}GB gz)`
+            : `${gb}GB`;
           statsInfoEl.textContent = `${totalItems.toLocaleString('en-US')} items, ${manifest.shards.length.toLocaleString('en-US')} shards, ${sizeLabel}, spanning ${start} to ${end}`;
         }
 
