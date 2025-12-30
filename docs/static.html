@@ -535,6 +535,24 @@
     }, ms);
   }
 
+  function clearStatus(msg = '') {
+    statusHoldUntil = 0;
+    setStatus(msg, true);
+  }
+
+  function setReferenceTime(ts, updateHeader = true) {
+    const next = Number(ts) || 0;
+    currentReferenceTime = next;
+    if (!updateHeader || !next) return;
+    const d = new Date(next * 1000);
+    const label = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
+    const title = `You are viewing HN at ${label}. All times are relative to 11:59 PM that day.`;
+    snapInfoEl.textContent = label;
+    snapInfoEl.title = title;
+    headerDateEl.textContent = label;
+    headerDateEl.title = title;
+  }
+
   function getWarpInputs() {
     return Array.from(document.querySelectorAll('.warp-date'));
   }
@@ -1234,6 +1252,7 @@
       sids = latestShardSids(LIST_SHARDS_TO_SCAN);
     }
 
+    clearStatus();
     setStatus(`loading ${view}${warpSid !== null ? ' (warped)' : ''}…`);
 
     let all = [];
@@ -1359,6 +1378,8 @@
       listRetryKey = null;
       listRetryCount = 0;
     }
+    if (referenceTime) setReferenceTime(referenceTime, true);
+    clearStatus();
     renderList(pageRows, view, page, offset, commentCounts);
 
     if (lastWarpSid != null && lastWarpDirection !== 0) {
@@ -2468,18 +2489,14 @@
         }
       }
     }
-    currentReferenceTime = warpDate
+    const targetReferenceTime = warpDate
       ? parseISODateUTC(warpDate, true)
       : (manifest?.snapshot_time || 0);
 
-    if (currentReferenceTime) {
-      const d = new Date(currentReferenceTime * 1000);
-      const label = d.toLocaleDateString('en-US', { weekday: 'long', month: 'long', day: 'numeric', year: 'numeric', timeZone: 'UTC' });
-      const title = `You are viewing HN at ${label}. All times are relative to 11:59 PM that day.`;
-      snapInfoEl.textContent = label;
-      snapInfoEl.title = title;
-      headerDateEl.textContent = label;
-      headerDateEl.title = title;
+    const listViews = new Set(['news','newest','ask','show','jobs']);
+    const deferReferenceTime = listViews.has(view);
+    if (!deferReferenceTime) {
+      setReferenceTime(targetReferenceTime, true);
     }
     if (warpDate) {
       setWarpInputs(warpDate);
