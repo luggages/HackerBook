@@ -20,6 +20,7 @@
 const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
+const { execSync } = require("child_process");
 const readline = require("readline");
 const Database = require("better-sqlite3");
 
@@ -117,8 +118,14 @@ function spanDaysFloat(tmin, tmax) {
 function gzipFileSync(srcPath, dstPath) {
   const data = fs.readFileSync(srcPath);
   const gz = zlib.gzipSync(data, { level: 9 });
-  fs.writeFileSync(dstPath, gz);
+  const tmpPath = `${dstPath}.tmp`;
+  fs.writeFileSync(tmpPath, gz);
+  fs.renameSync(tmpPath, dstPath);
   return gz.length;
+}
+
+function validateGzipFileSync(gzPath) {
+  execSync(`gzip -t ${JSON.stringify(gzPath)}`, { stdio: "ignore" });
 }
 
 // -------------------- Staging (optional) --------------------
@@ -332,6 +339,12 @@ function vacuumAndGzipAllShards(manifest) {
       const gzPath = sqlitePath + ".gz";
       process.stdout.write(`[post] gzip shard ${s.sid}... `);
       const gzBytes = gzipFileSync(sqlitePath, gzPath);
+      try {
+        validateGzipFileSync(gzPath);
+      } catch (err) {
+        console.error(`\\n[post] gzip validation failed for shard ${s.sid}: ${err && err.message ? err.message : err}`);
+        process.exit(1);
+      }
       process.stdout.write(`${mb(gzBytes)}MB\n`);
 
       s.file = path.basename(gzPath);
