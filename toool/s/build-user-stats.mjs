@@ -16,18 +16,19 @@ const DEFAULT_MANIFEST = 'docs/static-manifest.json';
 const DEFAULT_SHARDS_DIR = 'docs/static-shards';
 const DEFAULT_OUT_DIR = 'docs/static-user-stats-shards';
 const DEFAULT_OUT_MANIFEST = 'docs/static-user-stats-manifest.json';
-
-const ALPHABET = '0123456789abcdefghijklmnopqrstuvwxyz_';
-const BUCKETS = ALPHABET.length;
+const DEFAULT_TARGET_MB = 15;
+const DEFAULT_BATCH = 5000;
+const SHARD_SIZE_CHECK_EVERY = 1000;
 
 function usage() {
   const msg = `Usage:
   toool/s/build-user-stats.mjs [--manifest PATH] [--shards-dir PATH]
                                [--out-dir PATH] [--out-manifest PATH]
+                               [--target-mb N] [--batch N]
                                [--gzip] [--keep-sqlite]
 
 Examples:
-  toool/s/build-user-stats.mjs --gzip
+  toool/s/build-user-stats.mjs --gzip --target-mb 15
 `;
   process.stdout.write(msg);
 }
@@ -38,6 +39,8 @@ function parseArgs(argv) {
     shardsDir: DEFAULT_SHARDS_DIR,
     outDir: DEFAULT_OUT_DIR,
     outManifest: DEFAULT_OUT_MANIFEST,
+    targetMb: DEFAULT_TARGET_MB,
+    batch: DEFAULT_BATCH,
     gzip: false,
     keepSqlite: false
   };
@@ -59,18 +62,13 @@ function parseArgs(argv) {
     i += 1;
   }
 
+  if (out['target-mb'] != null) out.targetMb = Number(out['target-mb']);
+  if (out['batch'] != null) out.batch = Number(out['batch']);
   return out;
 }
 
 function readJson(p) {
   return JSON.parse(fs.readFileSync(p, 'utf8'));
-}
-
-function charBucket(name) {
-  if (!name) return ALPHABET.indexOf('_');
-  const c = String(name).trim().toLowerCase()[0] || '_';
-  const idx = ALPHABET.indexOf(c);
-  return idx >= 0 ? idx : ALPHABET.indexOf('_');
 }
 
 function gzipFileSync(srcPath, dstPath) {
@@ -83,7 +81,6 @@ function gzipFileSync(srcPath, dstPath) {
 }
 
 function validateGzipFileSync(gzPath) {
-  // throws on failure
   zlib.gunzipSync(fs.readFileSync(gzPath));
 }
 
@@ -100,16 +97,6 @@ async function gunzipToTemp(srcPath, tmpRoot) {
     src.pipe(gunzip).pipe(dst);
   });
   return dstPath;
-}
-
-function openShardDb(shardPath, tmpRoot, tempFiles) {
-  if (!shardPath.endsWith('.gz')) return { path: shardPath, cleanup: false };
-  const tmpPath = path.join(tmpRoot, path.basename(shardPath, '.gz'));
-  if (fs.existsSync(tmpPath)) return { path: tmpPath, cleanup: false };
-  const data = zlib.gunzipSync(fs.readFileSync(shardPath));
-  fs.writeFileSync(tmpPath, data);
-  tempFiles.add(tmpPath);
-  return { path: tmpPath, cleanup: true };
 }
 
 function initUserDb(dbPath) {
@@ -172,6 +159,10 @@ function domainFromUrl(url) {
   }
 }
 
+function lowerName(name) {
+  return String(name || '').trim().toLowerCase();
+}
+
 async function main() {
   const args = parseArgs(process.argv);
   const manifestPath = path.resolve(args.manifest);
@@ -180,6 +171,8 @@ async function main() {
   const outManifest = path.resolve(args.outManifest);
   const gzipOut = !!args.gzip;
   const keepSqlite = !!args['keep-sqlite'];
+  const targetBytes = Math.floor(Number(args.targetMb || DEFAULT_TARGET_MB) * 1024 * 1024);
+  const batchSize = Math.max(1000, Number(args.batch || DEFAULT_BATCH));
 
   if (!fs.existsSync(manifestPath)) {
     console.error(`Manifest not found: ${manifestPath}`);
@@ -199,14 +192,11 @@ async function main() {
   const tmpRoot = await fsp.mkdtemp(path.join(os.tmpdir(), 'static-news-user-'));
   const tempFiles = new Set();
 
-  const shardDbs = [];
-  for (let i = 0; i < BUCKETS; i += 1) {
-    const dbPath = path.join(outDir, `user_${i}.sqlite`);
-    const db = initUserDb(dbPath);
-    shardDbs.push({ db, path: dbPath, sid: i, char: ALPHABET[i] });
-  }
+  const tempDbPath = path.join(tmpRoot, 'user_stats_all.sqlite');
+  const tempDb = initUserDb(tempDbPath);
+  tempDb.pragma('cache_size = -200000');
 
-  const upsertUser = shardDbs.map(({ db }) => db.prepare(`
+  const upsertUser = tempDb.prepare(`
     INSERT INTO users (username, first_time, last_time, items, comments, stories, ask, show, launch, jobs, polls, avg_score, sum_score, max_score, min_score, max_score_id, max_score_title)
     VALUES (@username, @first_time, @last_time, 1, @comments, @stories, @ask, @show, @launch, @jobs, @polls, @avg_score, @sum_score, @max_score, @min_score, @max_score_id, @max_score_title)
     ON CONFLICT(username) DO UPDATE SET
@@ -225,32 +215,31 @@ async function main() {
       min_score = MIN(users.min_score, excluded.min_score),
       max_score_id = CASE WHEN excluded.max_score > users.max_score THEN excluded.max_score_id ELSE users.max_score_id END,
       max_score_title = CASE WHEN excluded.max_score > users.max_score THEN excluded.max_score_title ELSE users.max_score_title END
-  `));
+  `);
 
-  const upsertDomain = shardDbs.map(({ db }) => db.prepare(`
+  const upsertDomain = tempDb.prepare(`
     INSERT INTO user_domains (username, domain, count)
     VALUES (?, ?, 1)
     ON CONFLICT(username, domain) DO UPDATE SET count = count + 1
-  `));
+  `);
 
-  const upsertMonth = shardDbs.map(({ db }) => db.prepare(`
+  const upsertMonth = tempDb.prepare(`
     INSERT INTO user_months (username, month, count)
     VALUES (?, ?, 1)
     ON CONFLICT(username, month) DO UPDATE SET count = count + 1
-  `));
+  `);
 
-  const txUser = shardDbs.map(({ db }, idx) => db.transaction((rows) => {
+  const txBatch = tempDb.transaction((rows) => {
     for (const r of rows) {
-      upsertUser[idx].run(r);
-      if (r.domain) upsertDomain[idx].run(r.username, r.domain);
-      if (r.month) upsertMonth[idx].run(r.username, r.month);
+      upsertUser.run(r);
+      if (r.domain) upsertDomain.run(r.username, r.domain);
+      if (r.month) upsertMonth.run(r.username, r.month);
     }
-  }));
+  });
 
   let totalItems = 0;
-  let totalUsers = 0;
-  const growthCounts = new Map();
   let shardIndex = 0;
+  let batch = [];
 
   try {
     for (const shard of shards) {
@@ -276,16 +265,8 @@ async function main() {
       const db = new Database(dbPath, { readonly: true });
       const iter = db.prepare('SELECT id, type, time, by, title, url, score FROM items WHERE by IS NOT NULL').iterate();
 
-      const buffers = Array.from({ length: BUCKETS }, () => []);
-      const seenUsers = new Set();
-
       for (const row of iter) {
         const username = String(row.by);
-        if (!seenUsers.has(username)) {
-          seenUsers.add(username);
-          totalUsers += 1;
-        }
-        const bucket = charBucket(username);
         const isComment = row.type === 'comment' ? 1 : 0;
         const isStory = row.type === 'story' ? 1 : 0;
         const isJob = row.type === 'job' ? 1 : 0;
@@ -296,7 +277,7 @@ async function main() {
         const isLaunch = isStory && /^Launch HN:/i.test(title) ? 1 : 0;
         const score = Number.isFinite(row.score) ? row.score : 0;
 
-        buffers[bucket].push({
+        batch.push({
           username,
           first_time: row.time || null,
           last_time: row.time || null,
@@ -318,40 +299,99 @@ async function main() {
         });
 
         totalItems += 1;
+        if (batch.length >= batchSize) {
+          txBatch(batch);
+          batch = [];
+        }
+
         if (totalItems % 200000 === 0) {
-          process.stdout.write(`\r[users] shard ${shardIndex}/${shards.length} sid ${shard.sid} | items ${totalItems.toLocaleString('en-US')} | users ${totalUsers.toLocaleString('en-US')}`);
+          process.stdout.write(`\r[users] shard ${shardIndex}/${shards.length} sid ${shard.sid} | items ${totalItems.toLocaleString('en-US')}`);
         }
       }
       db.close();
 
-      for (let i = 0; i < BUCKETS; i += 1) {
-        if (buffers[i].length) txUser[i](buffers[i]);
+      if (batch.length) {
+        txBatch(batch);
+        batch = [];
       }
-      process.stdout.write(`\r[users] shard ${shardIndex}/${shards.length} sid ${shard.sid} | items ${totalItems.toLocaleString('en-US')} | users ${totalUsers.toLocaleString('en-US')} ok`);
+
+      process.stdout.write(`\r[users] shard ${shardIndex}/${shards.length} sid ${shard.sid} | items ${totalItems.toLocaleString('en-US')} ok`);
     }
 
-    process.stdout.write(`\r[users] items ${totalItems.toLocaleString('en-US')} | users ${totalUsers.toLocaleString('en-US')}\n`);
+    process.stdout.write(`\r[users] items ${totalItems.toLocaleString('en-US')}\n`);
 
+    tempDb.exec('UPDATE users SET avg_score = CAST(sum_score AS REAL) / NULLIF(items, 0)');
+    tempDb.exec('CREATE INDEX IF NOT EXISTS idx_users_username ON users(username)');
+    tempDb.exec('CREATE INDEX IF NOT EXISTS idx_user_domains_username ON user_domains(username)');
+    tempDb.exec('CREATE INDEX IF NOT EXISTS idx_user_months_username ON user_months(username)');
+
+    const growthCounts = new Map();
+    const activeCounts = new Map();
+
+    const firstRows = tempDb.prepare('SELECT first_time FROM users WHERE first_time IS NOT NULL').iterate();
+    for (const row of firstRows) {
+      const m = monthKey(row.first_time);
+      if (!m) continue;
+      growthCounts.set(m, (growthCounts.get(m) || 0) + 1);
+    }
+
+    const activeRows = tempDb.prepare('SELECT month, COUNT(*) as c FROM user_months GROUP BY month').iterate();
+    for (const row of activeRows) {
+      if (!row.month) continue;
+      activeCounts.set(row.month, (activeCounts.get(row.month) || 0) + (row.c || 0));
+    }
+
+    const totalUsersRow = tempDb.prepare('SELECT COUNT(*) as c FROM users').get();
+    const totalUsers = totalUsersRow ? totalUsersRow.c : 0;
+
+    const userIter = tempDb.prepare('SELECT * FROM users ORDER BY username COLLATE NOCASE').iterate();
+    const domainIter = tempDb.prepare('SELECT username, domain, count FROM user_domains ORDER BY username COLLATE NOCASE').iterate();
+    const monthIter = tempDb.prepare('SELECT username, month, count FROM user_months ORDER BY username COLLATE NOCASE').iterate();
+
+    let domainRow = domainIter.next();
+    let monthRow = monthIter.next();
+
+    function nextDomain() {
+      if (domainRow.done) return null;
+      const row = domainRow.value;
+      domainRow = domainIter.next();
+      return row;
+    }
+
+    function nextMonth() {
+      if (monthRow.done) return null;
+      const row = monthRow.value;
+      monthRow = monthIter.next();
+      return row;
+    }
+
+    let shardSid = 0;
+    let shardDb = null;
+    let shardPath = null;
+    let shardUsers = 0;
+    let shardUserLo = null;
+    let shardUserHi = null;
     const shardMeta = [];
-    let uniqueUsers = 0;
-    for (const shardDb of shardDbs) {
-      shardDb.db.exec('UPDATE users SET avg_score = CAST(sum_score AS REAL) / NULLIF(items, 0)');
-      shardDb.db.exec('CREATE INDEX IF NOT EXISTS idx_users_last_time ON users(last_time)');
-      shardDb.db.exec('CREATE INDEX IF NOT EXISTS idx_users_items ON users(items)');
-      shardDb.db.exec('CREATE INDEX IF NOT EXISTS idx_user_domains ON user_domains(username)');
-      shardDb.db.exec('CREATE INDEX IF NOT EXISTS idx_user_months ON user_months(username)');
 
-      const userRows = shardDb.db.prepare('SELECT first_time FROM users WHERE first_time IS NOT NULL').iterate();
-      for (const row of userRows) {
-        const m = monthKey(row.first_time);
-        if (!m) continue;
-        growthCounts.set(m, (growthCounts.get(m) || 0) + 1);
-        uniqueUsers += 1;
-      }
+    function openShard() {
+      shardPath = path.join(outDir, `user_${shardSid}.sqlite`);
+      shardDb = initUserDb(shardPath);
+      shardDb.pragma('cache_size = -50000');
+      shardUsers = 0;
+      shardUserLo = null;
+      shardUserHi = null;
+    }
 
-      shardDb.db.close();
+    function finalizeShard() {
+      if (!shardDb) return;
+      shardDb.exec('UPDATE users SET avg_score = CAST(sum_score AS REAL) / NULLIF(items, 0)');
+      shardDb.exec('CREATE INDEX IF NOT EXISTS idx_users_last_time ON users(last_time)');
+      shardDb.exec('CREATE INDEX IF NOT EXISTS idx_users_items ON users(items)');
+      shardDb.exec('CREATE INDEX IF NOT EXISTS idx_user_domains ON user_domains(username)');
+      shardDb.exec('CREATE INDEX IF NOT EXISTS idx_user_months ON user_months(username)');
+      shardDb.close();
 
-      let finalPath = shardDb.path;
+      let finalPath = shardPath;
       let bytes = fs.statSync(finalPath).size;
       if (gzipOut) {
         const gzPath = `${finalPath}.gz`;
@@ -359,30 +399,87 @@ async function main() {
         try {
           validateGzipFileSync(gzPath);
         } catch (err) {
-          console.error(`\n[user] gzip validation failed for shard ${shardDb.sid}: ${err && err.message ? err.message : err}`);
+          console.error(`\n[user] gzip validation failed for shard ${shardSid}: ${err && err.message ? err.message : err}`);
           process.exit(1);
         }
         bytes = gzBytes;
         finalPath = gzPath;
-        if (!keepSqlite) fs.unlinkSync(shardDb.path);
+        if (!keepSqlite) fs.unlinkSync(shardPath);
       }
 
       shardMeta.push({
-        sid: shardDb.sid,
-        char: shardDb.char,
+        sid: shardSid,
+        user_lo: shardUserLo,
+        user_hi: shardUserHi,
+        users: shardUsers,
         file: path.basename(finalPath),
         bytes
       });
+
+      shardSid += 1;
+      shardDb = null;
+      shardPath = null;
     }
+
+    openShard();
+
+    const insertUser = () => shardDb.prepare(`
+      INSERT INTO users (username, first_time, last_time, items, comments, stories, ask, show, launch, jobs, polls, avg_score, sum_score, max_score, min_score, max_score_id, max_score_title)
+      VALUES (@username, @first_time, @last_time, @items, @comments, @stories, @ask, @show, @launch, @jobs, @polls, @avg_score, @sum_score, @max_score, @min_score, @max_score_id, @max_score_title)
+    `);
+    const insertDomain = () => shardDb.prepare('INSERT INTO user_domains (username, domain, count) VALUES (?, ?, ?)');
+    const insertMonth = () => shardDb.prepare('INSERT INTO user_months (username, month, count) VALUES (?, ?, ?)');
+
+    let userStmt = insertUser();
+    let domainStmt = insertDomain();
+    let monthStmt = insertMonth();
+    let userCountSinceCheck = 0;
+
+    for (const user of userIter) {
+      const uname = String(user.username || '');
+      if (!shardUserLo) shardUserLo = lowerName(uname);
+      shardUserHi = lowerName(uname);
+
+      userStmt.run(user);
+      shardUsers += 1;
+      userCountSinceCheck += 1;
+
+      while (domainRow && domainRow.username === uname) {
+        domainStmt.run(domainRow.username, domainRow.domain, domainRow.count);
+        domainRow = domainIter.next();
+        if (domainRow.done) domainRow = null;
+      }
+
+      while (monthRow && monthRow.username === uname) {
+        monthStmt.run(monthRow.username, monthRow.month, monthRow.count);
+        monthRow = monthIter.next();
+        if (monthRow.done) monthRow = null;
+      }
+
+      if (userCountSinceCheck >= SHARD_SIZE_CHECK_EVERY) {
+        userCountSinceCheck = 0;
+        const size = fs.statSync(shardPath).size;
+        if (size >= targetBytes && shardUsers > 0) {
+          finalizeShard();
+          openShard();
+          userStmt = insertUser();
+          domainStmt = insertDomain();
+          monthStmt = insertMonth();
+        }
+      }
+    }
+
+    if (shardUsers > 0) finalizeShard();
 
     const out = {
       version: 1,
       created_at: new Date().toISOString(),
+      target_mb: Number(args.targetMb || DEFAULT_TARGET_MB),
       shards: shardMeta,
-      alphabet: ALPHABET,
       totals: {
-        users: uniqueUsers
-      }
+        users: totalUsers
+      },
+      collation: 'nocase'
     };
 
     const growthMonths = Array.from(growthCounts.entries())
@@ -393,12 +490,18 @@ async function main() {
       return { month, new_users: count, total_users: cumulative };
     });
 
+    const activeMonths = Array.from(activeCounts.entries())
+      .sort((a, b) => a[0].localeCompare(b[0]));
+    out.user_active = activeMonths.map(([month, active_users]) => ({ month, active_users }));
+
     fs.writeFileSync(outManifest, JSON.stringify(out, null, 2));
     console.log(`Wrote ${outManifest}`);
   } finally {
+    try { tempDb.close(); } catch {}
     for (const p of tempFiles) {
       try { await fsp.unlink(p); } catch {}
     }
+    try { await fsp.unlink(tempDbPath); } catch {}
     try { await fsp.rmdir(tmpRoot); } catch {}
   }
 }

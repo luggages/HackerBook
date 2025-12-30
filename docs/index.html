@@ -251,8 +251,38 @@
       display: flex;
       align-items: center;
       gap: 8px;
-      margin-top: 8px;
+      margin-top: 10px;
     }
+    .query-run {
+      font-weight: bold;
+      border-color: #111;
+      box-shadow: inset 0 0 0 1px #fff;
+    }
+    .query-shards {
+      display: grid;
+      grid-template-columns: repeat(auto-fill, minmax(110px, 1fr));
+      gap: 0;
+      margin-top: 8px;
+      max-height: 160px;
+      overflow: auto;
+      padding: 0;
+      border: 1px solid #9a9a9a;
+      background: #f6f6ef;
+      font-size: 8pt;
+      justify-items: stretch;
+      align-items: stretch;
+    }
+    .query-shards label {
+      white-space: nowrap;
+      border-right: 1px solid #e0e0d6;
+      border-bottom: 1px solid #e0e0d6;
+      padding: 4px 6px;
+      background: #f9f9f2;
+      display: flex;
+      align-items: center;
+      gap: 4px;
+    }
+    .query-shards-actions { display: flex; align-items: center; gap: 6px; margin-top: 6px; }
     .query-output {
       font-family: ui-monospace, Menlo, Consolas, monospace;
       font-size: 9pt;
@@ -914,25 +944,41 @@
   async function loadUserStatsManifest() {
     if (userStatsManifest) return userStatsManifest;
     userStatsManifest = await fetchJsonMaybeGzip(PATHS.userStatsManifest);
+    if (userStatsManifest?.shards) {
+      userStatsManifest.shards = userStatsManifest.shards.slice().sort((a, b) => {
+        const al = String(a.user_lo || '');
+        const bl = String(b.user_lo || '');
+        return al.localeCompare(bl);
+      });
+    }
     return userStatsManifest;
   }
 
-  function bucketForUsername(name, alphabet) {
-    const c = (name || '').trim().toLowerCase()[0] || '_';
-    const idx = (alphabet || '').indexOf(c);
-    return idx >= 0 ? idx : (alphabet || '').indexOf('_');
+  function normalizeUser(name) {
+    return String(name || '').trim().toLowerCase();
   }
 
-  async function loadUserStatsShard(username) {
-    const manifest = await loadUserStatsManifest();
-    if (!manifest) return null;
-    const sid = bucketForUsername(username, manifest.alphabet);
-    if (sid == null || sid < 0) return null;
+  function findUserShard(name, shards) {
+    const target = normalizeUser(name);
+    let lo = 0;
+    let hi = shards.length - 1;
+    while (lo <= hi) {
+      const mid = (lo + hi) >> 1;
+      const s = shards[mid];
+      const loName = String(s.user_lo || '');
+      const hiName = String(s.user_hi || '');
+      if (target < loName) hi = mid - 1;
+      else if (target > hiName) lo = mid + 1;
+      else return s;
+    }
+    return null;
+  }
+
+  async function loadUserStatsShardRec(rec) {
+    if (!rec) return null;
+    const sid = rec.sid;
     if (userStatsCache.has(sid)) return userStatsCache.get(sid);
     if (userStatsInFlight.has(sid)) return userStatsInFlight.get(sid);
-
-    const rec = (manifest.shards || []).find(s => s.sid === sid);
-    if (!rec) return null;
 
     const promise = (async () => {
       try {
@@ -961,6 +1007,22 @@
     return promise;
   }
 
+  async function loadUserStatsShard(username) {
+    const manifest = await loadUserStatsManifest();
+    if (!manifest) return null;
+    const rec = findUserShard(username, manifest.shards || []);
+    if (!rec) return null;
+    return loadUserStatsShardRec(rec);
+  }
+
+  async function loadUserStatsShardBySid(sid) {
+    const manifest = await loadUserStatsManifest();
+    if (!manifest) return null;
+    const rec = (manifest.shards || []).find(s => s.sid === sid);
+    if (!rec) return null;
+    return loadUserStatsShardRec(rec);
+  }
+
   // -----------------------
   // SQL helpers
   // -----------------------
@@ -972,18 +1034,72 @@
     return rows[0] || null;
   }
 
+  const QUERY_RE = {
+    trailingSemis: /;+\s*$/g,
+    leadingSelect: /^(select|with)\b/i,
+    disallowed: /(\bpragma\b|\battach\b|\bdetach\b|\bdrop\b|\balter\b|\bupdate\b|\binsert\b|\bdelete\b|\bcreate\b|\bvacuum\b)/i,
+    limit: /\blimit\b/i,
+    limitValue: /limit\s+(\d+)/i,
+    orderBy: /order\s+by\s+([\s\S]+?)(?:\blimit\b|$)/i
+  };
+
   function isSafeQuery(sql) {
     const s = String(sql || '').trim().replace(/;+\s*$/g, '');
     if (!s) return false;
-    if (!/^(select|with)\b/i.test(s)) return false;
-    if (/(\\bpragma\\b|\\battach\\b|\\bdetach\\b|\\bdrop\\b|\\balter\\b|\\bupdate\\b|\\binsert\\b|\\bdelete\\b|\\bcreate\\b|\\bvacuum\\b)/i.test(s)) return false;
+    if (!QUERY_RE.leadingSelect.test(s)) return false;
+    if (QUERY_RE.disallowed.test(s)) return false;
     return true;
   }
 
-  function wrapQuery(sql, maxRows) {
-    const s = String(sql || '').trim().replace(/;+\s*$/g, '');
-    if (/\\blimit\\b/i.test(s)) return s;
-    return `SELECT * FROM (${s}) LIMIT ${maxRows}`;
+  function getLimit(sql) {
+    const s = String(sql || '').trim().replace(QUERY_RE.trailingSemis, '');
+    const m = QUERY_RE.limitValue.exec(s);
+    return m ? Number(m[1]) : null;
+  }
+
+  function addLimitIfMissing(sql, maxRows) {
+    const s = String(sql || '').trim().replace(QUERY_RE.trailingSemis, '');
+    if (QUERY_RE.limit.test(s)) return s;
+    return `${s} LIMIT ${maxRows}`;
+  }
+
+  function parseOrderBy(sql) {
+    const s = String(sql || '').trim().replace(QUERY_RE.trailingSemis, '');
+    const m = QUERY_RE.orderBy.exec(s);
+    if (!m) return [];
+    return m[1]
+      .split(',')
+      .map(part => part.trim())
+      .filter(Boolean)
+      .map(part => {
+        const bits = part.split(/\s+/);
+        const key = bits[0].replace(/[`\"]/g, '');
+        const dir = (bits[1] || 'asc').toLowerCase() === 'desc' ? 'desc' : 'asc';
+        return { key, dir };
+      });
+  }
+
+  function sortRows(rows, order) {
+    if (!order || !order.length) return rows;
+    const dirVal = dir => (dir === 'desc' ? -1 : 1);
+    rows.sort((a, b) => {
+      for (const o of order) {
+        const av = a[o.key];
+        const bv = b[o.key];
+        if (av == null && bv == null) continue;
+        if (av == null) return 1;
+        if (bv == null) return -1;
+        if (typeof av === 'number' && typeof bv === 'number') {
+          const diff = av - bv;
+          if (diff !== 0) return diff * dirVal(o.dir);
+        } else {
+          const diff = String(av).localeCompare(String(bv));
+          if (diff !== 0) return diff * dirVal(o.dir);
+        }
+      }
+      return 0;
+    });
+    return rows;
   }
 
   // -----------------------
@@ -1704,6 +1820,35 @@
     new uPlot(opts, data, target);
   }
 
+  function setupUserActiveChart(active) {
+    const target = document.getElementById('user-active-chart');
+    if (!target || !window.uPlot || !active || !active.length) return;
+
+    const xs = active.map(g => {
+      const [y, m] = String(g.month).split('-').map(Number);
+      return Date.UTC(y, (m || 1) - 1, 1) / 1000;
+    });
+    const ys = active.map(g => g.active_users || 0);
+    if (!xs.length) return;
+
+    const data = [xs, ys];
+    const opts = {
+      width: target.clientWidth || 640,
+      height: 200,
+      scales: { x: { time: true } },
+      series: [
+        {},
+        { label: 'Active users', stroke: '#0000cc', width: 1 }
+      ],
+      axes: [
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' } },
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' } }
+      ]
+    };
+
+    new uPlot(opts, data, target);
+  }
+
   async function renderArchiveView(token = 0) {
     setStatus('Loading archive…');
     const data = await loadArchiveIndex();
@@ -1711,9 +1856,11 @@
 
     const shards = (data.shards || []).slice().sort((a,b) => a.sid - b.sid);
     let userGrowth = [];
+    let userActive = [];
     try {
       const um = await loadUserStatsManifest();
       userGrowth = um?.user_growth || [];
+      userActive = um?.user_active || [];
     } catch {}
     const manifestRows = (data.manifests || []).map(m => `
       <tr>
@@ -1731,6 +1878,10 @@
       <tr><td style="padding:0 10px 12px 10px">
         <div class="subtext" style="margin-bottom:6px">HN user growth over time</div>
         <div id="user-growth-chart" class="archive-chart"></div>
+      </td></tr>
+      <tr><td style="padding:0 10px 12px 10px">
+        <div class="subtext" style="margin-bottom:6px">HN monthly active users</div>
+        <div id="user-active-chart" class="archive-chart"></div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
         <table class="record-table">
@@ -1795,24 +1946,46 @@
     requestAnimationFrame(() => {
       setupArchiveChart(shards);
       setupUserGrowthChart(userGrowth);
+      setupUserActiveChart(userActive);
     });
     setStatus('');
   }
 
   async function renderQueryView(token = 0) {
-    const schema = `tables:\n  items(id INTEGER PRIMARY KEY, type TEXT, time INTEGER, by TEXT, title TEXT, text TEXT, url TEXT, score INTEGER, parent INTEGER)\n  edges(parent_id INTEGER, ord INTEGER, child_id INTEGER)\n\nexamples:\n  SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY time DESC LIMIT 30\n  SELECT by, COUNT(*) as items FROM items GROUP BY by ORDER BY items DESC LIMIT 20\n  SELECT * FROM items WHERE time BETWEEN 1700000000 AND 1700864000 LIMIT 100`;
+    setStatus('');
+    const schemaContent = `tables:\n  items(id INTEGER PRIMARY KEY, type TEXT, time INTEGER, by TEXT, title TEXT, text TEXT, url TEXT, score INTEGER, parent INTEGER)\n  edges(parent_id INTEGER, ord INTEGER, child_id INTEGER)\n\nexamples:\n  SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY score DESC LIMIT 30\n  SELECT by, COUNT(*) as items FROM items GROUP BY by ORDER BY items DESC LIMIT 20\n  SELECT * FROM items WHERE time BETWEEN 1700000000 AND 1700864000 LIMIT 100`;
+    const schemaUsers = `tables:\n  users(username TEXT PRIMARY KEY, first_time INTEGER, last_time INTEGER, items INTEGER, comments INTEGER, stories INTEGER, ask INTEGER, show INTEGER, launch INTEGER, jobs INTEGER, polls INTEGER, avg_score REAL, sum_score INTEGER, max_score INTEGER, min_score INTEGER, max_score_id INTEGER, max_score_title TEXT)\n  user_domains(username TEXT, domain TEXT, count INTEGER)\n  user_months(username TEXT, month TEXT, count INTEGER)\n\nexamples:\n  SELECT username, items, comments, stories FROM users ORDER BY items DESC LIMIT 50\n  SELECT username, avg_score, max_score FROM users ORDER BY max_score DESC LIMIT 25\n  SELECT username, first_time, last_time FROM users ORDER BY last_time DESC LIMIT 25\n  SELECT domain, SUM(count) as posts FROM user_domains GROUP BY domain ORDER BY posts DESC LIMIT 50\n  SELECT month, SUM(count) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 24`;
+    const schemaAll = `${schemaContent}\n\n${schemaUsers}`;
+    const allShards = (timeShards && timeShards.length)
+      ? timeShards.map(s => s.sid)
+      : (manifest?.shards || []).map(s => s.sid);
+    let userShards = [];
+    try {
+      const um = await loadUserStatsManifest();
+      userShards = (um?.shards || []).map(s => s.sid);
+    } catch {}
     tableEl.innerHTML = `
       <tr><td style="padding:10px">
         <div class="subtext">Query the archive (SQL)</div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
         <div class="subtext" style="margin-bottom:6px">Schema</div>
-        <div class="schema-block">${schema}</div>
+        <div class="schema-block" id="query-schema"></div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
         <textarea id="query-input" class="query-input" spellcheck="false">SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY time DESC LIMIT 30</textarea>
+        <div class="subtext" style="margin:10px 0 4px 0">Shard filter (optional)</div>
+        <select id="query-mode" class="warp-input top" title="Choose data source" style="margin-bottom:6px;">
+          <option value="content">Content shards</option>
+          <option value="users">User stats shards</option>
+        </select>
+        <div class="query-shards" id="query-shards"></div>
+        <div class="query-shards-actions">
+          <button class="time-step" id="query-shards-all" type="button">ALL / CLEAR</button>
+          <span class="subtext" style="color:#666; font-style:italic;">Pick any shards to limit to just those.</span>
+        </div>
         <div class="query-actions">
-          <button class="time-step" id="query-run" type="button">Run query</button>
+          <button class="time-step query-run" id="query-run" type="button">QUERY RUN</button>
           <span class="subtext" id="query-status"></span>
         </div>
       </td></tr>
@@ -1826,6 +1999,44 @@
     const status = document.getElementById('query-status');
     const output = document.getElementById('query-output');
     const runBtn = document.getElementById('query-run');
+    const shardsWrap = document.getElementById('query-shards');
+    const shardsAllBtn = document.getElementById('query-shards-all');
+    const modeSelect = document.getElementById('query-mode');
+    const schemaEl = document.getElementById('query-schema');
+
+    function renderSchema(mode) {
+      if (!schemaEl) return;
+      schemaEl.textContent = schemaAll;
+    }
+
+    function renderShardCheckboxes(mode) {
+      if (!shardsWrap) return;
+      const list = mode === 'users' ? userShards : allShards;
+      shardsWrap.innerHTML = list.map(sid => (
+        `<label><input type="checkbox" data-sid="${sid}"> shard ${sid}</label>`
+      )).join(' ');
+    }
+
+    if (modeSelect) {
+      modeSelect.addEventListener('change', () => {
+        const mode = modeSelect.value || 'content';
+        renderSchema(mode);
+        renderShardCheckboxes(mode);
+      });
+    }
+
+    renderSchema('content');
+    renderShardCheckboxes('content');
+    if (shardsAllBtn && shardsWrap) {
+      shardsAllBtn.addEventListener('click', () => {
+        shardsWrap.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = true; });
+      });
+    }
+    if (shardsAllBtn && shardsWrap) {
+      shardsAllBtn.addEventListener('click', () => {
+        shardsWrap.querySelectorAll('input[type="checkbox"]').forEach(cb => { cb.checked = false; });
+      });
+    }
 
     const MAX_ROWS = 500;
 
@@ -1836,20 +2047,45 @@
         output.textContent = 'Only SELECT/CTE queries are allowed.';
         return;
       }
-      const sql = wrapQuery(raw, MAX_ROWS);
-      const shards = (timeShards && timeShards.length)
-        ? timeShards.map(s => s.sid)
-        : (manifest?.shards || []).map(s => s.sid);
+      const requestedLimit = getLimit(raw);
+      const effectiveLimit = requestedLimit ? Math.min(requestedLimit, MAX_ROWS) : MAX_ROWS;
+      const perShardLimit = Math.min(MAX_ROWS * 2, effectiveLimit * 2);
+      const order = parseOrderBy(raw);
+      const sql = addLimitIfMissing(raw, perShardLimit);
+      const mode = modeSelect ? modeSelect.value : 'content';
+      let shards = (mode === 'users' ? userShards : allShards).slice();
+      if (shardsWrap) {
+        const checked = Array.from(shardsWrap.querySelectorAll('input[type="checkbox"]:checked'))
+          .map(cb => Number(cb.getAttribute('data-sid')))
+          .filter(Number.isFinite);
+        if (checked.length) shards = checked;
+      }
       const results = [];
       let scanned = 0;
-      status.textContent = 'Running...';
+      let skipped = 0;
+      status.textContent = requestedLimit && requestedLimit > MAX_ROWS
+        ? `Running... (limit capped at ${MAX_ROWS})`
+        : 'Running...';
       output.textContent = '';
 
       for (const sid of shards) {
         if (token && token !== routeToken) return;
-        const db = await loadShardBySid(sid);
+        let db = null;
+        try {
+          db = mode === 'users'
+            ? await loadUserStatsShardBySid(sid)
+            : await loadShardBySid(sid);
+        } catch (err) {
+          skipped += 1;
+          status.textContent = `Scanned ${scanned}/${shards.length} shard(s), skipped ${skipped}...`;
+          continue;
+        }
         scanned += 1;
-        if (!db) continue;
+        if (!db) {
+          skipped += 1;
+          status.textContent = `Scanned ${scanned}/${shards.length} shard(s), skipped ${skipped}...`;
+          continue;
+        }
         try {
           const rows = sqlAll(db, sql);
           results.push(...rows);
@@ -1858,17 +2094,18 @@
           status.textContent = '';
           return;
         }
-        status.textContent = `Scanned ${scanned}/${timeShards.length || shards.length} shard(s)...`;
-        if (results.length >= MAX_ROWS) break;
+        status.textContent = `Scanned ${scanned}/${shards.length} shard(s), skipped ${skipped}...`;
         await new Promise(r => requestAnimationFrame(() => r()));
       }
 
-      const trimmed = results.slice(0, MAX_ROWS);
+      sortRows(results, order);
+      const trimmed = results.slice(0, effectiveLimit);
       output.textContent = JSON.stringify(trimmed, null, 2) || 'No rows.';
-      status.textContent = `Rows: ${trimmed.length}`;
+      status.textContent = `Rows: ${trimmed.length} (skipped ${skipped})`;
     }
 
     if (runBtn) runBtn.addEventListener('click', runQuery);
+    setStatus('');
   }
 
   async function renderUserView(username, token = 0) {
