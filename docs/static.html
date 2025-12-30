@@ -4,7 +4,7 @@
   <meta name="referrer" content="origin">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>HN Backup Tape - A Static Retrospective of Hacker News (2006-2025)</title>
-  <link rel="icon" href="cd.png">
+  <link rel="icon" type="image/png" href="cd.png?v=20251230">
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css">
   <style>
     html { -webkit-text-size-adjust: 100%; text-size-adjust: 100%; }
@@ -1296,20 +1296,23 @@
     if (token && token !== routeToken) return;
     const retryKey = `${view}|${page}|${warpSid ?? ''}|${warpDate ?? ''}`;
     if (!pageRows.length) {
+      const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
+      const label = labelMap[view] || view;
+      const titled = label.charAt(0).toUpperCase() + label.slice(1);
+      const noItemsMsg = view !== 'news' ? `No ${titled} for this day.` : 'No more items for this day.';
+
       // Avoid wiping the current view if a warp is still resolving or aborted.
       if (warpAbort && warpAbort.signal && warpAbort.signal.aborted) {
         setStatus('');
         return;
       }
+
+      if (initialRoute && (view !== 'news' || page > 1)) {
+        nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
+        return;
+      }
       if ((warpDate || warpSid !== null) && (view !== 'news' || page > 1)) {
-        const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
-        const label = labelMap[view] || view;
-        const titled = label.charAt(0).toUpperCase() + label.slice(1);
-        if (initialRoute) {
-          nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
-          return;
-        }
-        holdStatus(view !== 'news' ? `No ${titled} for this day.` : 'No more items for this day.', 2000);
+        holdStatus(noItemsMsg, 2000);
       }
       if (listRetryKey !== retryKey) {
         listRetryKey = retryKey;
@@ -1329,19 +1332,13 @@
           }
         }, 250);
         if (warpDate || warpSid !== null) {
-          const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
-          const label = labelMap[view] || view;
-          const titled = label.charAt(0).toUpperCase() + label.slice(1);
-          holdStatus(view !== 'news' ? `No ${titled} for this day.` : 'No more items for this day.', 2000);
+          holdStatus(noItemsMsg, 2000);
         } else {
           setStatus('Loading…');
         }
         return;
       }
       if (warpDate || warpSid !== null) {
-        const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
-        const label = labelMap[view] || view;
-        const titled = label.charAt(0).toUpperCase() + label.slice(1);
         const refSid = warpSid ?? findShardForTs(referenceTime)?.sid;
         if (refSid != null) {
           const fallback = findNextShardWithPosts(refSid);
@@ -1352,9 +1349,10 @@
             return;
           }
         }
-        holdStatus(`No ${titled} for this day.`, 2000);
+        holdStatus(noItemsMsg, 2000);
       }
       if (tableEl && tableEl.innerHTML && !tableEl.innerHTML.includes('Loading')) {
+        holdStatus(noItemsMsg, 2000);
         return;
       }
     } else {
@@ -2143,6 +2141,7 @@
     const modeSelect = document.getElementById('query-mode');
     const schemaEl = document.getElementById('query-schema');
     const templateSelect = document.getElementById('query-template');
+    let selectedTemplateKey = '';
 
     const templates = {
       'stories-score': {
@@ -2202,7 +2201,7 @@
         mode: 'users'
       },
       'users-months': {
-        sql: "SELECT month, COUNT(*) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 36",
+        sql: "SELECT month, SUM(count) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 36",
         mode: 'users'
       }
     };
@@ -2223,6 +2222,7 @@
     if (templateSelect && input) {
       templateSelect.addEventListener('change', () => {
         const key = templateSelect.value;
+        selectedTemplateKey = key || '';
         if (!key || !templates[key]) return;
         input.value = templates[key].sql;
         if (modeSelect) {
@@ -2255,6 +2255,22 @@
     }
 
     const MAX_ROWS = 500;
+
+    function aggregateTemplateResults(rows, templateKey) {
+      if (templateKey === 'users-months') {
+        const byMonth = new Map();
+        rows.forEach(r => {
+          const m = r?.month;
+          if (!m) return;
+          const val = Number(r.active ?? r.count ?? 0) || 0;
+          byMonth.set(m, (byMonth.get(m) || 0) + val);
+        });
+        return Array.from(byMonth.entries())
+          .map(([month, active]) => ({ month, active }))
+          .sort((a, b) => b.month.localeCompare(a.month));
+      }
+      return rows;
+    }
 
     function addTimeDecorations(rows) {
       return rows.map(row => {
@@ -2329,8 +2345,9 @@
         await new Promise(r => requestAnimationFrame(() => r()));
       }
 
-      sortRows(results, order);
-      const trimmed = results.slice(0, effectiveLimit);
+      const aggregated = aggregateTemplateResults(results, selectedTemplateKey);
+      sortRows(aggregated, order);
+      const trimmed = aggregated.slice(0, effectiveLimit);
       const decorated = addTimeDecorations(trimmed);
       output.textContent = JSON.stringify(decorated, null, 2) || 'No rows.';
       status.textContent = `Rows: ${trimmed.length} (skipped ${skipped})`;
