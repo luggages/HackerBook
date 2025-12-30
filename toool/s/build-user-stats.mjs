@@ -352,22 +352,17 @@ async function main() {
     const domainIter = tempDb.prepare('SELECT username, domain, count FROM user_domains ORDER BY username COLLATE NOCASE').iterate();
     const monthIter = tempDb.prepare('SELECT username, month, count FROM user_months ORDER BY username COLLATE NOCASE').iterate();
 
-    let domainRow = domainIter.next();
-    let monthRow = monthIter.next();
+    const nextDomainRow = () => {
+      const r = domainIter.next();
+      return r.done ? null : r.value;
+    };
+    const nextMonthRow = () => {
+      const r = monthIter.next();
+      return r.done ? null : r.value;
+    };
 
-    function nextDomain() {
-      if (domainRow.done) return null;
-      const row = domainRow.value;
-      domainRow = domainIter.next();
-      return row;
-    }
-
-    function nextMonth() {
-      if (monthRow.done) return null;
-      const row = monthRow.value;
-      monthRow = monthIter.next();
-      return row;
-    }
+    let domainRow = nextDomainRow();
+    let monthRow = nextMonthRow();
 
     let shardSid = 0;
     let shardDb = null;
@@ -451,14 +446,12 @@ async function main() {
 
       while (domainRow && domainRow.username === uname) {
         domainStmt.run(domainRow.username, domainRow.domain, domainRow.count);
-        domainRow = domainIter.next();
-        if (domainRow.done) domainRow = null;
+        domainRow = nextDomainRow();
       }
 
       while (monthRow && monthRow.username === uname) {
         monthStmt.run(monthRow.username, monthRow.month, monthRow.count);
-        monthRow = monthIter.next();
-        if (monthRow.done) monthRow = null;
+        monthRow = nextMonthRow();
       }
 
       if (userCountSinceCheck >= SHARD_SIZE_CHECK_EVERY) {

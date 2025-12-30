@@ -20,6 +20,8 @@
 const fs = require("fs");
 const path = require("path");
 const zlib = require("zlib");
+const os = require("os");
+const { pipeline } = require("stream/promises");
 const { execSync } = require("child_process");
 const readline = require("readline");
 const Database = require("better-sqlite3");
@@ -68,6 +70,9 @@ const MAX_RAW_BYTES = Math.floor((MAX_MB * 1024 * 1024) / Math.max(GZIP_RATIO, 0
 const PRESORTED = !!args.presorted;
 const FROM_STAGING = !!args["from-staging"];
 const DELETE_STAGING = !!args["delete-staging"];
+const RESTART_ETL = !!args["restart"];
+const REBUILD_MANIFEST = !!args["rebuild-manifest"];
+const POST_CONCURRENCY = Number(args["post-concurrency"] ?? Math.max(1, Math.floor(os.cpus().length / 2)));
 
 // Post-pass behaviors
 const GZIP_SHARDS = !!args.gzip;                 // do final gz + manifest rewrite
@@ -128,6 +133,141 @@ function gzipFileSync(srcPath, dstPath) {
 
 function validateGzipFileSync(gzPath) {
   execSync(`gzip -t ${JSON.stringify(gzPath)}`, { stdio: "ignore" });
+}
+
+async function gzipFile(srcPath, dstPath) {
+  const tmpPath = `${dstPath}.tmp`;
+  await pipeline(
+    fs.createReadStream(srcPath),
+    zlib.createGzip({ level: 9 }),
+    fs.createWriteStream(tmpPath)
+  );
+  const stat = fs.statSync(tmpPath);
+  fs.renameSync(tmpPath, dstPath);
+  return stat.size;
+}
+
+async function runPool(items, limit, worker) {
+  const queue = items.slice();
+  const workers = Array.from({ length: Math.max(1, limit) }, async () => {
+    while (queue.length) {
+      const item = queue.shift();
+      if (!item) break;
+      await worker(item);
+    }
+  });
+  await Promise.all(workers);
+}
+
+function checkSqliteIntegrity(sqlitePath) {
+  const db = new Database(sqlitePath, { readonly: true });
+  const row = db.prepare("PRAGMA quick_check").get();
+  db.close();
+  return row && (row.quick_check === "ok" || row["quick_check"] === "ok");
+}
+
+async function gunzipToTemp(srcPath, tmpRoot) {
+  const dstPath = path.join(tmpRoot, path.basename(srcPath, ".gz"));
+  await pipeline(
+    fs.createReadStream(srcPath),
+    zlib.createGunzip(),
+    fs.createWriteStream(dstPath)
+  );
+  return dstPath;
+}
+
+async function rebuildManifestFromShards() {
+  const files = fs.readdirSync(OUT_DIR);
+  const shardRe = /^shard_(\d+)\.sqlite(\.gz)?$/;
+  const shardMap = new Map();
+  for (const file of files) {
+    const match = shardRe.exec(file);
+    if (!match) continue;
+    const sid = Number(match[1]);
+    const isGz = !!match[2];
+    const existing = shardMap.get(sid);
+    if (!existing || (isGz && !existing.isGz)) {
+      shardMap.set(sid, { sid, file, isGz });
+    }
+  }
+  const shards = Array.from(shardMap.values()).sort((a, b) => a.sid - b.sid);
+  if (!shards.length) {
+    throw new Error(`No shard files found in ${OUT_DIR}`);
+  }
+
+  const tmpRoot = fs.mkdtempSync(path.join(os.tmpdir(), "static-news-rebuild-"));
+  const tempFiles = new Set();
+  const out = {
+    version: 1,
+    created_at: new Date().toISOString(),
+    sharding: {
+      axis: "id",
+      rebuild_from_shards: true
+    },
+    shards: []
+  };
+
+  let globalTmin = null;
+  let globalTmax = null;
+  let index = 0;
+
+  try {
+    for (const shard of shards) {
+      index += 1;
+      const fullPath = path.join(OUT_DIR, shard.file);
+      let dbPath = fullPath;
+      if (shard.isGz) {
+        dbPath = await gunzipToTemp(fullPath, tmpRoot);
+        tempFiles.add(dbPath);
+      }
+
+      const db = new Database(dbPath, { readonly: true });
+      const row = db.prepare(`
+        SELECT
+          MIN(id) as id_lo,
+          MAX(id) as id_hi,
+          MIN(time) as tmin,
+          MAX(time) as tmax,
+          COUNT(*) as count
+        FROM items
+      `).get();
+      db.close();
+
+      const bytes = fs.statSync(fullPath).size;
+      const record = {
+        sid: shard.sid,
+        id_lo: row?.id_lo ?? null,
+        id_hi: row?.id_hi ?? null,
+        tmin: row?.tmin ?? null,
+        tmax: row?.tmax ?? null,
+        count: row?.count ?? 0,
+        raw_bytes_est: null,
+        file: shard.file,
+        bytes
+      };
+      out.shards.push(record);
+
+      if (record.tmin != null) {
+        globalTmin = globalTmin == null ? record.tmin : Math.min(globalTmin, record.tmin);
+      }
+      if (record.tmax != null) {
+        globalTmax = globalTmax == null ? record.tmax : Math.max(globalTmax, record.tmax);
+      }
+
+      process.stdout.write(`\r[rebuild] shard ${index}/${shards.length} sid ${shard.sid}`);
+    }
+    process.stdout.write("\n");
+  } finally {
+    for (const p of tempFiles) {
+      try { fs.unlinkSync(p); } catch {}
+    }
+    try { fs.rmdirSync(tmpRoot); } catch {}
+  }
+
+  out.snapshot_time = globalTmax;
+  fs.writeFileSync(MANIFEST_PATH, JSON.stringify(out, null, 2));
+  console.log(`[rebuild] Wrote manifest: ${MANIFEST_PATH}`);
+  return out;
 }
 
 // -------------------- Staging (optional) --------------------
@@ -309,27 +449,85 @@ function computeEffectiveTimeStats(sqlitePath, fallbackMin, fallbackMax) {
 }
 
 // -------------------- Post-pass: VACUUM + gzip + manifest rewrite --------------------
-function vacuumAndGzipAllShards(manifest) {
+async function vacuumAndGzipAllShards(manifest, opts = {}) {
+  const isRestart = !!opts.restart;
+  const checkCount = Math.max(1, POST_CONCURRENCY * 2);
 
   console.log(`\n[post] Finalizing shards...`);
-  console.log(`[post] vacuum: ${VACUUM_AT_END ? "yes" : "no"} | gzip: ${GZIP_SHARDS ? "yes" : "no"} | keep-sqlite: ${KEEP_SQLITE ? "yes" : "no"}`);
+  console.log(`[post] vacuum: ${VACUUM_AT_END ? "yes" : "no"} | gzip: ${GZIP_SHARDS ? "yes" : "no"} | keep-sqlite: ${KEEP_SQLITE ? "yes" : "no"} | concurrency: ${POST_CONCURRENCY}`);
 
   const updated = { ...manifest, shards: manifest.shards.map(s => ({ ...s })) };
+  const gzipQueue = [];
 
+  if (isRestart) {
+    const sqliteTodo = updated.shards
+      .filter(s => fs.existsSync(path.join(OUT_DIR, `shard_${s.sid}.sqlite`)) && !fs.existsSync(path.join(OUT_DIR, `shard_${s.sid}.sqlite.gz`)))
+      .sort((a, b) => a.sid - b.sid)
+      .slice(0, checkCount);
+
+    const allGz = updated.shards
+      .filter(s => fs.existsSync(path.join(OUT_DIR, `shard_${s.sid}.sqlite.gz`)))
+      .sort((a, b) => a.sid - b.sid);
+    const allSqlite = updated.shards
+      .filter(s => fs.existsSync(path.join(OUT_DIR, `shard_${s.sid}.sqlite`)))
+      .sort((a, b) => a.sid - b.sid);
+    const firstMissing = allGz.length ? allGz[allGz.length - 1].sid + 1 : (allSqlite[0]?.sid ?? 0);
+    const pauseLine = `[post] restart detected: gz=${allGz.length} sqlite=${allSqlite.length} next_sid=${firstMissing}`;
+    console.log(pauseLine);
+
+    if (sqliteTodo.length) {
+      process.stdout.write(`[post] restart: checking ${sqliteTodo.length} sqlite shards...`);
+      for (const s of sqliteTodo) {
+        const sqlitePath = path.join(OUT_DIR, `shard_${s.sid}.sqlite`);
+        if (!checkSqliteIntegrity(sqlitePath)) {
+          console.error(`\n[post] sqlite integrity check failed: shard ${s.sid}`);
+          process.exit(1);
+        }
+      }
+      process.stdout.write("ok\n");
+    }
+
+    const gzExisting = updated.shards
+      .filter(s => fs.existsSync(path.join(OUT_DIR, `shard_${s.sid}.sqlite.gz`)))
+      .sort((a, b) => a.sid - b.sid);
+    const gzTail = gzExisting.slice(Math.max(0, gzExisting.length - checkCount));
+    if (gzTail.length) {
+      process.stdout.write(`[post] restart: checking ${gzTail.length} gzip shards...`);
+      for (const s of gzTail) {
+        const gzPath = path.join(OUT_DIR, `shard_${s.sid}.sqlite.gz`);
+        try {
+          validateGzipFileSync(gzPath);
+        } catch (err) {
+          console.error(`\n[post] gzip validation failed for shard ${s.sid}: ${err && err.message ? err.message : err}`);
+          process.exit(1);
+        }
+      }
+      process.stdout.write("ok\n");
+    }
+  }
+
+  let shardIndex = 0;
   for (const s of updated.shards) {
+    shardIndex += 1;
     const sqlitePath = path.join(OUT_DIR, `shard_${s.sid}.sqlite`);
-    if (!fs.existsSync(sqlitePath)) {
-      // If build already deleted or never wrote, skip
+    const gzPath = sqlitePath + ".gz";
+    const hasSqlite = fs.existsSync(sqlitePath);
+    const hasGz = fs.existsSync(gzPath);
+    if (!hasSqlite) {
+      if (hasGz && GZIP_SHARDS) {
+        s.file = path.basename(gzPath);
+        s.bytes = fs.statSync(gzPath).size;
+      }
       continue;
     }
 
     if (VACUUM_AT_END) {
-      process.stdout.write(`[post] vacuum shard ${s.sid}... `);
+      process.stdout.write(`\r[post] shard ${shardIndex}/${updated.shards.length} sid ${s.sid} | vacuum...`);
       const db = new Database(sqlitePath);
       // VACUUM only once, after indexes/analyze, outside build loop
       db.exec(`VACUUM;`);
       db.close();
-      process.stdout.write(`ok\n`);
+      process.stdout.write(`\r[post] shard ${shardIndex}/${updated.shards.length} sid ${s.sid} | vacuum ok`);
     }
 
     const eff = computeEffectiveTimeStats(sqlitePath, s.tmin, s.tmax);
@@ -338,26 +536,39 @@ function vacuumAndGzipAllShards(manifest) {
     s.time_null = eff.timeNull;
 
     if (GZIP_SHARDS) {
-      const gzPath = sqlitePath + ".gz";
-      process.stdout.write(`[post] gzip shard ${s.sid}... `);
-      const gzBytes = gzipFileSync(sqlitePath, gzPath);
-      try {
-        validateGzipFileSync(gzPath);
-      } catch (err) {
-        console.error(`\\n[post] gzip validation failed for shard ${s.sid}: ${err && err.message ? err.message : err}`);
-        process.exit(1);
+      if (!hasGz) {
+        gzipQueue.push({ s, sqlitePath, gzPath });
+      } else {
+        s.file = path.basename(gzPath);
+        s.bytes = fs.statSync(gzPath).size;
+        if (!KEEP_SQLITE) fs.unlinkSync(sqlitePath);
       }
-      process.stdout.write(`${mb(gzBytes)}MB\n`);
-
-      s.file = path.basename(gzPath);
-      s.bytes = gzBytes;
-
-      if (!KEEP_SQLITE) fs.unlinkSync(sqlitePath);
     } else {
       // ensure bytes reflect sqlite size
       s.file = path.basename(sqlitePath);
       s.bytes = fs.statSync(sqlitePath).size;
     }
+    process.stdout.write(`\r[post] shard ${shardIndex}/${updated.shards.length} sid ${s.sid} | stats ok\n`);
+  }
+
+  if (GZIP_SHARDS && gzipQueue.length) {
+    let done = 0;
+    const total = gzipQueue.length;
+    await runPool(gzipQueue, POST_CONCURRENCY, async ({ s, sqlitePath, gzPath }) => {
+      const gzBytes = await gzipFile(sqlitePath, gzPath);
+      try {
+        validateGzipFileSync(gzPath);
+      } catch (err) {
+        console.error(`\n[post] gzip validation failed for shard ${s.sid}: ${err && err.message ? err.message : err}`);
+        process.exit(1);
+      }
+      s.file = path.basename(gzPath);
+      s.bytes = gzBytes;
+      if (!KEEP_SQLITE) fs.unlinkSync(sqlitePath);
+      done += 1;
+      process.stdout.write(`\r[post] gzip ${done}/${total} | last sid ${s.sid} | ${mb(gzBytes)}MB`);
+    });
+    process.stdout.write("\n");
   }
 
   return updated;
@@ -365,6 +576,59 @@ function vacuumAndGzipAllShards(manifest) {
 
 // -------------------- Main build --------------------
 async function main() {
+  if (REBUILD_MANIFEST) {
+    try {
+      await rebuildManifestFromShards();
+    } catch (err) {
+      console.error(`[rebuild] failed: ${err && err.message ? err.message : err}`);
+      process.exit(1);
+    }
+    return;
+  }
+  if (RESTART_ETL) {
+    let manifestPath = MANIFEST_PATH;
+    const prepassPath = `${MANIFEST_PATH}.prepass`;
+    if (!fs.existsSync(manifestPath)) {
+      const gzPath = `${MANIFEST_PATH}.gz`;
+      if (fs.existsSync(prepassPath)) {
+        manifestPath = prepassPath;
+      } else if (fs.existsSync(gzPath)) {
+        const gz = fs.readFileSync(gzPath);
+        const raw = zlib.gunzipSync(gz);
+        const manifest = JSON.parse(raw.toString("utf8"));
+        const finalManifest = await vacuumAndGzipAllShards(manifest, { restart: true });
+        fs.writeFileSync(MANIFEST_PATH, JSON.stringify(finalManifest, null, 2));
+        console.log(`\n[3/3] Wrote manifest: ${MANIFEST_PATH}`);
+        if (RUN_ARCHIVE_INDEX) {
+          try {
+            console.log(`[post] building archive index...`);
+            require("./build-archive-index.js");
+          } catch (err) {
+            console.warn(`[post] archive index failed: ${err && err.message ? err.message : err}`);
+          }
+        }
+        return;
+      } else {
+        console.warn(`[post] manifest missing; rebuilding from shards...`);
+        await rebuildManifestFromShards();
+        manifestPath = MANIFEST_PATH;
+      }
+    }
+    const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+    const finalManifest = await vacuumAndGzipAllShards(manifest, { restart: true });
+    fs.writeFileSync(MANIFEST_PATH, JSON.stringify(finalManifest, null, 2));
+    console.log(`\n[3/3] Wrote manifest: ${MANIFEST_PATH}`);
+    if (RUN_ARCHIVE_INDEX) {
+      try {
+        console.log(`[post] building archive index...`);
+        require("./build-archive-index.js");
+      } catch (err) {
+        console.warn(`[post] archive index failed: ${err && err.message ? err.message : err}`);
+      }
+    }
+    return;
+  }
+
   const files = FROM_STAGING ? [] : listGzFiles(DATA_DIR);
   if (!FROM_STAGING && !files.length) {
     console.error(`No .json.gz files found in ${DATA_DIR}`);
@@ -653,8 +917,12 @@ async function main() {
   console.log(`\n[build] global start: ${globalTmin} (${isoUTC(globalTmin)})`);
   console.log(`[build] global end:   ${globalTmax} (${isoUTC(globalTmax)})`);
 
+  // Write pre-pass manifest immediately so we can restart after interruption.
+  fs.writeFileSync(`${MANIFEST_PATH}.prepass`, JSON.stringify(manifest, null, 2));
+  console.log(`\n[2/3] Wrote prepass manifest: ${MANIFEST_PATH}.prepass`);
+
   // Post-pass: VACUUM + gzip (and rewrite manifest)
-  const finalManifest = vacuumAndGzipAllShards(manifest);
+  const finalManifest = await vacuumAndGzipAllShards(manifest);
 
   fs.writeFileSync(MANIFEST_PATH, JSON.stringify(finalManifest, null, 2));
   console.log(`\n[3/3] Wrote manifest: ${MANIFEST_PATH}`);

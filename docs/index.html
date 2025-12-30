@@ -3,7 +3,7 @@
 <head>
   <meta name="referrer" content="origin">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Static News - A Static Mirror of Hacker News Right in your Browser</title>
+  <title>HN Backup Tape - A Static Retrospective of Hacker News (2006-2025)</title>
   <link rel="icon" href="cd.png">
   <link rel="stylesheet" href="vendor/uplot/uPlot.min.css">
   <style>
@@ -104,19 +104,20 @@
       display: inline-flex;
       align-items: center;
       justify-content: flex-end;
-      gap: 2px;
+      gap: 3px;
       width: 100%;
     }
     #status-right, #status-mid {
       color: #111;
       font-size: 8pt;
       display: inline-block;
-      width: 160px;
+      width: 180px;
       text-align: right;
       margin-left: 0;
-      margin-right: 2px;
+      margin-right: 0;
       vertical-align: middle;
       font-family: ui-monospace, Menlo, Consolas, monospace;
+      white-space: nowrap;
     }
     #status-mid { display: none; }
     .header-date {
@@ -124,6 +125,7 @@
       font-size: 7pt;
       font-family: ui-monospace, Menlo, Consolas, monospace;
       color: #f6f6ef;
+      white-space: nowrap;
     }
     .thread-hidden { display: none; }
     .togg {
@@ -194,6 +196,11 @@
       border: 1px solid #9a9a9a;
       margin-top: 10px;
       margin-bottom: 16px;
+      padding-bottom: 6px;
+      box-sizing: border-box;
+    }
+    .archive-chart.pad-bottom {
+      padding-bottom: 10px;
     }
     .warp-input {
       font-family: ui-monospace, Menlo, Consolas, monospace;
@@ -314,7 +321,7 @@
       .header-date { grid-row: 1; grid-column: 1 / -1; margin: 0; }
       .warp-form.top { grid-row: 2; grid-column: 1 / -1; }
       .archive-badge-link { grid-row: 3; grid-column: 2; }
-      #status-right { grid-row: 3; grid-column: 1; justify-self: end; margin-right: 2px; }
+      #status-right { grid-row: 3; grid-column: 1; justify-self: end; margin-right: 3px; }
     }
     /* Mobile: smaller indents */
     @media (max-width: 600px) {
@@ -326,8 +333,19 @@
       .commtext { max-width: 100%; margin-right: 10px; }
       #hnmain { width: 100% !important; }
       #status-right { display: none; }
-      #status-mid { display: inline-block; }
+      #status-mid { display: block; width: 100%; margin-top: 2px; }
       .status-cell { width: auto; }
+      .topbar > table { display: block; width: 100%; }
+      .topbar > table > tbody > tr {
+        display: flex;
+        align-items: flex-start;
+        gap: 8px;
+      }
+      .topbar > table > tbody > tr > td { display: block; }
+      .nav-cell { flex: 1 1 auto; min-width: 0; }
+      .status-cell { flex: 0 0 auto; }
+      .nav-wrap { flex-wrap: wrap; }
+      .pagetop { display: block; }
       .header-right { flex-direction: column; align-items: flex-end; gap: 4px; }
       .header-date { order: 1; display: block; margin: 0; }
       .warp-form.top { order: 2; }
@@ -337,6 +355,7 @@
       .warp-input.top { width: 140px; }
       .footer-info { text-align: center; font-size: 10px; }
       .yclinks { font-size: 10px; padding-bottom: 12px; }
+      .nav-wrap { flex-wrap: wrap; }
     }
   </style>
 
@@ -354,9 +373,10 @@
             <td class="nav-cell">
               <div class="nav-wrap">
                 <span class="pagetop">
-                  <b class="hnname"><a href="?view=news" data-spa id="home-link" title="Go to the most recent snapshot">Static News</a></b>
+                  <b class="hnname"><a href="?view=news" data-spa id="home-link" title="Go to the most recent snapshot">HN Backup Tape</a></b>
                   <a href="?view=newest" data-spa>new</a> |
                   <a href="?view=news" data-spa>front</a> |
+                  <a href="#" id="start-link" title="Go to the first day">start</a> |
                   <a href="?view=ask" data-spa>ask</a> |
                   <a href="?view=show" data-spa>show</a> |
                   <a href="?view=jobs" data-spa>jobs</a> |
@@ -485,14 +505,30 @@
   // sid -> db
   const shardCache = new Map();
   const collapsedIds = new Set();
+  const postsBySid = new Map();
 
   // -----------------------
   // Utilities
   // -----------------------
-  function setStatus(msg) {
+  let statusHoldUntil = 0;
+  function setStatus(msg, force = false) {
+    if (!force && statusHoldUntil && Date.now() < statusHoldUntil) {
+      return;
+    }
     const text = msg || '';
+    if (!text) statusHoldUntil = 0;
     statusRightEl.textContent = text;
     statusMidEl.textContent = text;
+  }
+
+  function holdStatus(msg, ms = 2000) {
+    statusHoldUntil = Date.now() + ms;
+    setStatus(msg, true);
+    setTimeout(() => {
+      if (Date.now() >= statusHoldUntil && statusRightEl.textContent === msg) {
+        setStatus('', true);
+      }
+    }, ms);
   }
 
   function getWarpInputs() {
@@ -1107,6 +1143,8 @@
   // -----------------------
   function rebuildTimeIndex() {
     const effMap = new Map((archiveIndex?.shards || []).map(s => [s.sid, s]));
+    postsBySid.clear();
+    (archiveIndex?.shards || []).forEach(s => postsBySid.set(s.sid, s.posts || 0));
     timeShards = (manifest?.shards || []).map(s => {
       const eff = effMap.get(s.sid);
       return {
@@ -1132,6 +1170,28 @@
   function latestShardSids(n) {
     const shards = timeShards || [];
     return shards.slice(-n).map(s => s.sid).reverse();
+  }
+
+  function findFirstShardWithPosts() {
+    if (!timeShards.length) return null;
+    for (const shard of timeShards) {
+      if ((postsBySid.get(shard.sid) || 0) > 0) return shard;
+    }
+    return timeShards[0];
+  }
+
+  function findNextShardWithPosts(startSid) {
+    if (!timeIndexBySid.has(startSid)) return null;
+    const idx = timeIndexBySid.get(startSid);
+    for (let i = idx; i < timeShards.length; i++) {
+      const shard = timeShards[i];
+      if ((postsBySid.get(shard.sid) || 0) > 0) return shard;
+    }
+    for (let i = idx - 1; i >= 0; i--) {
+      const shard = timeShards[i];
+      if ((postsBySid.get(shard.sid) || 0) > 0) return shard;
+    }
+    return timeShards[idx];
   }
 
   async function listView(view, page, warpSid = null, warpDate = null, token = 0) {
@@ -1251,8 +1311,28 @@
         setStatus('Loading…');
         return;
       }
+      if (warpDate || warpSid !== null) {
+        const labelMap = { news: 'front', newest: 'new', ask: 'ask', show: 'show', jobs: 'jobs' };
+        const label = labelMap[view] || view;
+        const titled = label.charAt(0).toUpperCase() + label.slice(1);
+        if (view !== 'news') {
+          holdStatus(`No ${titled} items for this day.`, 2000);
+          nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
+          return;
+        }
+        const refSid = warpSid ?? findShardForTs(referenceTime)?.sid;
+        if (refSid != null) {
+          const fallback = findNextShardWithPosts(refSid);
+          if (fallback && fallback.sid !== refSid) {
+            const iso = formatISODateUTC(fallback.tmin || fallback.tmax || referenceTime);
+            setWarpInputs(iso);
+            nav({ view: 'news', p: 1, warp: fallback.sid, warp_date: iso, id: null });
+            return;
+          }
+        }
+        holdStatus(`No ${titled} items for this day.`, 2000);
+      }
       if (tableEl && tableEl.innerHTML && !tableEl.innerHTML.includes('Loading')) {
-        setStatus('');
         return;
       }
     } else {
@@ -1265,7 +1345,9 @@
       prefetchAdjacentShard(lastWarpSid, lastWarpDirection);
     }
 
-    setStatus('');
+    if (!statusHoldUntil || Date.now() >= statusHoldUntil) {
+      setStatus('');
+    }
   }
 
   function prefetchAdjacentShard(sid, direction) {
@@ -1709,16 +1791,29 @@
     const target = document.getElementById('activity-chart');
     if (!target || !window.uPlot || !shards.length) return;
 
+    const MAX_CHART_SPAN_DAYS = 14;
     const points = shards.map(s => {
       const x = s.tmax_eff || s.tmax || s.tmin || 0;
       const tmin = s.tmin_eff || s.tmin || 0;
       const tmax = s.tmax_eff || s.tmax || 0;
       if (!x || !tmin || !tmax) return null;
-      const spanDays = Math.max(1, Math.round((tmax - tmin) / 86400));
-      return { x, y: (s.count || 0) / spanDays };
+      const spanDays = Math.max(1, Math.min(MAX_CHART_SPAN_DAYS, Math.round((tmax - tmin) / 86400)));
+      const rate = (s.count || 0) / spanDays;
+      if (!Number.isFinite(rate) || rate <= 0) return null;
+      return { x, y: rate };
     }).filter(Boolean);
-    const xs = points.map(p => p.x);
     const ys = points.map(p => p.y);
+    if (!ys.length) return;
+
+    const sortedRates = ys.slice().sort((a, b) => a - b);
+    const medianRate = sortedRates[Math.floor(sortedRates.length / 2)] || 0;
+    const filteredPoints = points.filter(p => {
+      const year = new Date(p.x * 1000).getUTCFullYear();
+      if (year >= 2012 && medianRate > 0 && p.y < medianRate * 0.02) return false;
+      return true;
+    });
+    const xs = filteredPoints.map(p => p.x);
+    const ysFiltered = filteredPoints.map(p => p.y);
     if (!xs.length) return;
 
     function wheelZoomPlugin({ factor = 0.75 } = {}) {
@@ -1772,18 +1867,19 @@
       };
     }
 
-    const data = [xs, ys];
+    const data = [xs, ysFiltered];
     const opts = {
       width: target.clientWidth || 640,
       height: 220,
+      padding: [8, 16, 28, 54],
       scales: { x: { time: true } },
       series: [
         {},
         { label: 'Items', stroke: '#0000cc', width: 1 }
       ],
       axes: [
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } },
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } }
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 28 },
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 54, label: 'Items/day' }
       ],
       plugins: [wheelZoomPlugin(), dragPanPlugin()]
     };
@@ -1805,15 +1901,16 @@
     const data = [xs, ys];
     const opts = {
       width: target.clientWidth || 640,
-      height: 200,
+      height: 210,
+      padding: [8, 16, 28, 54],
       scales: { x: { time: true } },
       series: [
         {},
-        { label: 'Users', stroke: '#0000cc', width: 1 }
+        { label: 'Users (posted)', stroke: '#0000cc', width: 1 }
       ],
       axes: [
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } },
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } }
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 28 },
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 54 }
       ]
     };
 
@@ -1834,15 +1931,16 @@
     const data = [xs, ys];
     const opts = {
       width: target.clientWidth || 640,
-      height: 200,
+      height: 210,
+      padding: [8, 16, 28, 54],
       scales: { x: { time: true } },
       series: [
         {},
-        { label: 'Active users', stroke: '#0000cc', width: 1 }
+        { label: 'Active users (posted)', stroke: '#0000cc', width: 1 }
       ],
       axes: [
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } },
-        { stroke: '#828282', grid: { stroke: '#e0e0d6' } }
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 28 },
+        { stroke: '#828282', grid: { stroke: '#e0e0d6' }, size: 54 }
       ]
     };
 
@@ -1872,16 +1970,16 @@
 
     tableEl.innerHTML = `
       <tr><td style="padding:0 10px 12px 10px">
-        <div class="subtext" style="margin-bottom:6px">HN activity over time</div>
+        <div class="subtext" style="margin-bottom:6px">HN activity over time (items/day)</div>
         <div id="activity-chart" class="archive-chart"></div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
-        <div class="subtext" style="margin-bottom:6px">HN user growth over time</div>
-        <div id="user-growth-chart" class="archive-chart"></div>
+        <div class="subtext" style="margin-bottom:6px">HN user growth (users with posts/comments)</div>
+        <div id="user-growth-chart" class="archive-chart pad-bottom"></div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
-        <div class="subtext" style="margin-bottom:6px">HN monthly active users</div>
-        <div id="user-active-chart" class="archive-chart"></div>
+        <div class="subtext" style="margin-bottom:6px">HN monthly active users (posting/commenting)</div>
+        <div id="user-active-chart" class="archive-chart pad-bottom"></div>
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
         <table class="record-table">
@@ -1974,6 +2072,25 @@
       </td></tr>
       <tr><td style="padding:0 10px 12px 10px">
         <textarea id="query-input" class="query-input" spellcheck="false">SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY time DESC LIMIT 30</textarea>
+        <div class="subtext" style="margin:8px 0 4px 0">Template queries</div>
+        <select id="query-template" class="warp-input top" title="Pick a prewritten query" style="margin-bottom:8px;">
+          <option value="">Select a query…</option>
+          <option value="stories-score">Top stories by score</option>
+          <option value="stories-recent">Recent stories</option>
+          <option value="comments-recent">Recent comments</option>
+          <option value="ask-score">Ask HN leaderboard</option>
+          <option value="show-score">Show HN leaderboard</option>
+          <option value="polls-score">Top polls</option>
+          <option value="stories-domain">Top story domains</option>
+          <option value="users-items">Most prolific users</option>
+          <option value="users-comments">Most active commenters</option>
+          <option value="users-score">Highest max score users</option>
+          <option value="users-fresh">Newest active users</option>
+          <option value="users-gaps">Longest user spans</option>
+          <option value="domains-users">Domains by unique users</option>
+          <option value="domains-loyal">Most loyal domains</option>
+          <option value="users-months">Monthly active users</option>
+        </select>
         <div class="subtext" style="margin:10px 0 4px 0">Shard filter (optional)</div>
         <select id="query-mode" class="warp-input top" title="Choose data source" style="margin-bottom:6px;">
           <option value="content">Content shards</option>
@@ -2003,6 +2120,70 @@
     const shardsAllBtn = document.getElementById('query-shards-all');
     const modeSelect = document.getElementById('query-mode');
     const schemaEl = document.getElementById('query-schema');
+    const templateSelect = document.getElementById('query-template');
+
+    const templates = {
+      'stories-score': {
+        sql: "SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY score DESC LIMIT 30",
+        mode: 'content'
+      },
+      'stories-recent': {
+        sql: "SELECT id, title, by, time, score FROM items WHERE type='story' ORDER BY time DESC LIMIT 50",
+        mode: 'content'
+      },
+      'comments-recent': {
+        sql: "SELECT id, by, time, parent FROM items WHERE type='comment' ORDER BY time DESC LIMIT 50",
+        mode: 'content'
+      },
+      'ask-score': {
+        sql: "SELECT id, title, by, score FROM items WHERE type='story' AND title LIKE 'Ask HN:%' ORDER BY score DESC LIMIT 50",
+        mode: 'content'
+      },
+      'show-score': {
+        sql: "SELECT id, title, by, score FROM items WHERE type='story' AND title LIKE 'Show HN:%' ORDER BY score DESC LIMIT 50",
+        mode: 'content'
+      },
+      'polls-score': {
+        sql: "SELECT id, title, by, score FROM items WHERE type='poll' ORDER BY score DESC LIMIT 50",
+        mode: 'content'
+      },
+      'stories-domain': {
+        sql: "SELECT substr(url, instr(url, '//') + 2) as domain, COUNT(*) as posts FROM items WHERE type='story' AND url IS NOT NULL GROUP BY domain ORDER BY posts DESC LIMIT 50",
+        mode: 'content'
+      },
+      'users-items': {
+        sql: "SELECT username, items, comments, stories FROM users ORDER BY items DESC LIMIT 50",
+        mode: 'users'
+      },
+      'users-comments': {
+        sql: "SELECT username, comments FROM users ORDER BY comments DESC LIMIT 50",
+        mode: 'users'
+      },
+      'users-score': {
+        sql: "SELECT username, max_score, max_score_id, max_score_title FROM users ORDER BY max_score DESC LIMIT 30",
+        mode: 'users'
+      },
+      'users-fresh': {
+        sql: "SELECT username, first_time, last_time, items FROM users ORDER BY last_time DESC LIMIT 50",
+        mode: 'users'
+      },
+      'users-gaps': {
+        sql: "SELECT username, first_time, last_time FROM users ORDER BY (last_time - first_time) DESC LIMIT 50",
+        mode: 'users'
+      },
+      'domains-users': {
+        sql: "SELECT domain, COUNT(DISTINCT username) as users FROM user_domains GROUP BY domain ORDER BY users DESC LIMIT 50",
+        mode: 'users'
+      },
+      'domains-loyal': {
+        sql: "SELECT username, domain, count FROM user_domains ORDER BY count DESC LIMIT 50",
+        mode: 'users'
+      },
+      'users-months': {
+        sql: "SELECT month, SUM(count) as active FROM user_months GROUP BY month ORDER BY month DESC LIMIT 36",
+        mode: 'users'
+      }
+    };
 
     function renderSchema(mode) {
       if (!schemaEl) return;
@@ -2015,6 +2196,19 @@
       shardsWrap.innerHTML = list.map(sid => (
         `<label><input type="checkbox" data-sid="${sid}"> shard ${sid}</label>`
       )).join(' ');
+    }
+
+    if (templateSelect && input) {
+      templateSelect.addEventListener('change', () => {
+        const key = templateSelect.value;
+        if (!key || !templates[key]) return;
+        input.value = templates[key].sql;
+        if (modeSelect) {
+          modeSelect.value = templates[key].mode;
+          renderSchema(modeSelect.value);
+          renderShardCheckboxes(modeSelect.value);
+        }
+      });
     }
 
     if (modeSelect) {
@@ -2039,6 +2233,21 @@
     }
 
     const MAX_ROWS = 500;
+
+    function addTimeDecorations(rows) {
+      return rows.map(row => {
+        if (!row || typeof row !== 'object') return row;
+        const out = { ...row };
+        Object.entries(row).forEach(([key, value]) => {
+          if (value == null || typeof value !== 'number') return;
+          if (!/time$/i.test(key) && !/first_time$/i.test(key) && !/last_time$/i.test(key)) return;
+          if (value < 1000000000 || value > 9999999999) return;
+          const iso = new Date(value * 1000).toISOString().slice(0, 10);
+          out[`${key}_ymd`] = iso;
+        });
+        return out;
+      });
+    }
 
     async function runQuery() {
       if (!input || !output || !status) return;
@@ -2100,7 +2309,8 @@
 
       sortRows(results, order);
       const trimmed = results.slice(0, effectiveLimit);
-      output.textContent = JSON.stringify(trimmed, null, 2) || 'No rows.';
+      const decorated = addTimeDecorations(trimmed);
+      output.textContent = JSON.stringify(decorated, null, 2) || 'No rows.';
       status.textContent = `Rows: ${trimmed.length} (skipped ${skipped})`;
     }
 
@@ -2204,6 +2414,19 @@
     const id = p.get('id');
     const warp = p.get('warp') ? parseInt(p.get('warp'), 10) : null;
     const warpDate = p.get('warp_date');
+    if (warpDate && timeRange.min && timeRange.max) {
+      let ts = parseISODateUTC(warpDate, false);
+      if (ts) {
+        if (ts < timeRange.min) ts = timeRange.min;
+        if (ts > timeRange.max) ts = timeRange.max;
+        const iso = formatISODateUTC(ts);
+        if (iso !== warpDate) {
+          const targetShard = findShardForTs(ts);
+          nav({ view, p: 1, warp: targetShard?.sid ?? null, warp_date: iso, id: null });
+          return;
+        }
+      }
+    }
     currentReferenceTime = warpDate
       ? parseISODateUTC(warpDate, true)
       : (manifest?.snapshot_time || 0);
@@ -2218,7 +2441,9 @@
       headerDateEl.title = title;
     }
     if (warpDate) {
-      if (warpDate) setWarpInputs(warpDate);
+      setWarpInputs(warpDate);
+    } else if (manifest?.snapshot_time) {
+      setWarpInputs(formatISODateUTC(manifest.snapshot_time));
     }
 
     if (view === 'item' && id) {
@@ -2297,13 +2522,19 @@
 
         const totalItems = (manifest.shards || []).reduce((m, s) => m + (s.count || 0), 0);
         const totalBytes = (manifest.shards || []).reduce((m, s) => m + (s.bytes || 0), 0);
+        const totalRawBytes = (manifest.shards || []).reduce((m, s) => {
+          const raw = Number(s.raw_bytes_est);
+          return m + (Number.isFinite(raw) ? raw : 0);
+        }, 0);
         const tmin = (manifest.shards || []).reduce((m, s) => Math.min(m, s.tmin || m), Number.POSITIVE_INFINITY);
         const tmax = (manifest.shards || []).reduce((m, s) => Math.max(m, s.tmax || 0), 0);
         if (Number.isFinite(tmin) && tmax) {
           const start = formatDateShort(tmin);
           const end = formatDateShort(tmax);
           const gb = (totalBytes / (1024 ** 3)).toFixed(1);
-          statsInfoEl.textContent = `${totalItems.toLocaleString('en-US')} items, ${manifest.shards.length.toLocaleString('en-US')} shards, ${gb}GB, spanning ${start} to ${end}`;
+          const rawGb = totalRawBytes > 0 ? (totalRawBytes / (1024 ** 3)).toFixed(1) : null;
+          const sizeLabel = rawGb ? `${rawGb}GB raw (${gb}GB gz)` : `${gb}GB`;
+          statsInfoEl.textContent = `${totalItems.toLocaleString('en-US')} items, ${manifest.shards.length.toLocaleString('en-US')} shards, ${sizeLabel}, spanning ${start} to ${end}`;
         }
 
       if (!timeControlsBound) {
@@ -2346,7 +2577,22 @@
       if (homeLink) {
         homeLink.addEventListener('click', (e) => {
           e.preventDefault();
+          if (manifest?.snapshot_time) {
+            setWarpInputs(formatISODateUTC(manifest.snapshot_time));
+          }
           nav({ view: 'news', p: 1, warp: null, warp_date: null, id: null });
+        });
+      }
+
+      const startLink = document.getElementById('start-link');
+      if (startLink) {
+        startLink.addEventListener('click', (e) => {
+          e.preventDefault();
+          const targetShard = findFirstShardWithPosts();
+          if (!targetShard) return;
+          const iso = formatISODateUTC(targetShard.tmin || targetShard.tmax || timeRange.min);
+          setWarpInputs(iso);
+          nav({ view: 'news', p: 1, warp: targetShard.sid, warp_date: iso, id: null });
         });
       }
 

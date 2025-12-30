@@ -11,18 +11,21 @@ DOCS_DIR="${REPO_DIR}/docs"
 RAW_DIR_PRIMARY="${REPO_DIR}/data/raw"
 RAW_DIR_ALT="${REPO_DIR}/toool/data/raw"
 USE_STAGING=0
+RESTART_ETL=0
 
-CUSTOM_DOMAIN="${CUSTOM_DOMAIN:-staticnews.dosaygo.com}"
+CUSTOM_DOMAIN="${CUSTOM_DOMAIN:-hnbackuptape.dosaygo.com}"
 EXPECTED_CNAME="${EXPECTED_CNAME:-static-news-dtg.pages.dev}"
 PAGES_PROJECT_NAME="${PAGES_PROJECT_NAME:-static-news}"
 
 for arg in "$@"; do
   case "${arg}" in
     --use-staging) USE_STAGING=1 ;;
+    --restart-etl) RESTART_ETL=1 ;;
     -h|--help)
       cat <<'EOF'
-Usage: toool/s/predeploy-checks.sh [--use-staging]
+Usage: toool/s/predeploy-checks.sh [--use-staging] [--restart-etl]
   --use-staging  Run ETL from ./data/static-staging-hn.sqlite and skip raw download
+  --restart-etl  Resume ETL post-pass (vacuum/gzip) from existing shards/manifest
 EOF
       exit 0
       ;;
@@ -68,6 +71,37 @@ in_repo() {
 require_cmd() {
   local cmd="${1}"
   command -v "${cmd}" >/dev/null 2>&1 || fail "Missing required command: ${cmd}"
+}
+
+ensure_gcloud() {
+  if command -v gcloud >/dev/null 2>&1; then
+    return 0
+  fi
+  warn "gcloud not found"
+  if command -v brew >/dev/null 2>&1; then
+    confirm_step "Install gcloud via brew? (google-cloud-sdk)" brew install --cask google-cloud-sdk
+  else
+    warn "Homebrew not found. Install gcloud from https://cloud.google.com/sdk/docs/install"
+    return 1
+  fi
+  command -v gcloud >/dev/null 2>&1 || return 1
+}
+
+ensure_gcloud_auth() {
+  if ! command -v gcloud >/dev/null 2>&1; then
+    return 1
+  fi
+  local acct=""
+  acct="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)"
+  if [[ -n "${acct}" ]]; then
+    pass "gcloud auth OK (${acct})"
+    return 0
+  fi
+  warn "gcloud not authenticated"
+  confirm_step "Run 'gcloud auth login' now?" gcloud auth login
+  acct="$(gcloud auth list --filter=status:ACTIVE --format='value(account)' 2>/dev/null || true)"
+  [[ -n "${acct}" ]] || fail "gcloud auth still missing"
+  pass "gcloud auth OK (${acct})"
 }
 
 require_file() {
@@ -154,7 +188,7 @@ check_cname() {
   if command -v dig >/dev/null 2>&1; then
     cname="$(dig +short CNAME "${domain}" | head -n 1 | tr -d '\r' | sed 's/\.$//')"
   elif command -v nslookup >/dev/null 2>&1; then
-    cname="$(nslookup -type=CNAME "${domain}" 2>/dev/null | awk '/canonical name/ {print ${NF}}' | head -n 1 | tr -d '\r' | sed 's/\.$//')"
+    cname="$(nslookup -type=CNAME "${domain}" 2>/dev/null | awk '/canonical name/ {print $NF}' | head -n 1 | tr -d '\r' | sed 's/\.$//')"
   else
     warn "No dig/nslookup available; skipping CNAME check"
     return 0
@@ -169,7 +203,7 @@ check_cname() {
   pass "CNAME OK: ${domain} → ${cname}"
 }
 
-log "🧭 Static News pre‑deploy checklist"
+log "🧭 HN Backup Tape pre‑deploy checklist"
 log "---------------------------------"
 
 step "Checking prerequisites"
@@ -186,7 +220,19 @@ step "Checking raw data"
 mkdir -p "${RAW_DIR_PRIMARY}" "${RAW_DIR_ALT}"
 RAW_DIR="${RAW_DIR_PRIMARY}"
 
-if [[ "${USE_STAGING}" -eq 1 ]]; then
+if [[ "${RESTART_ETL}" -eq 1 ]]; then
+  if [[ ! -f "${DOCS_DIR}/static-manifest.json" && ! -f "${DOCS_DIR}/static-manifest.json.gz" && ! -f "${DOCS_DIR}/static-manifest.json.prepass" ]]; then
+    warn "Manifest missing; restart will rebuild from shards."
+  fi
+  shard_sqlite_count="$(count_glob "${DOCS_DIR}/static-shards/*.sqlite")"
+  shard_gz_count="$(count_glob "${DOCS_DIR}/static-shards/*.sqlite.gz")"
+  if [[ "${shard_sqlite_count}" -eq 0 && "${shard_gz_count}" -eq 0 ]]; then
+    fail "No shard files found for restart in ${DOCS_DIR}/static-shards"
+  fi
+  pass "Restarting ETL post-pass from existing shards"
+  post_concurrency="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)"
+  confirm_step "Restart ETL post-pass now? (etl-hn.js --restart --gzip)" in_repo node ./etl-hn.js --restart --gzip --post-concurrency "${post_concurrency}"
+elif [[ "${USE_STAGING}" -eq 1 ]]; then
   if [[ -f "${REPO_DIR}/data/static-staging-hn.sqlite" ]]; then
     pass "Using staging DB: ${REPO_DIR}/data/static-staging-hn.sqlite"
   else
@@ -206,6 +252,9 @@ else
     warn "Using toool/data/raw; ETL will be run with --data \"${RAW_DIR}\""
   else
     warn "No raw data found in data/raw/*.json.gz (or toool/data/raw/*.json.gz)"
+    if ensure_gcloud; then
+      ensure_gcloud_auth
+    fi
     confirm_step "Run download script now? (download_hn.sh)" bash -lc "cd \"${REPO_DIR}\" && bash ./download_hn.sh"
     raw_primary_count="$(count_glob "${RAW_DIR_PRIMARY}/*.json.gz")"
     if [[ "${raw_primary_count}" -gt 0 ]]; then
@@ -286,7 +335,8 @@ step "Validating JSON manifests"
 node - "${DOCS_DIR}/archive-index.json.gz" "${DOCS_DIR}/static-user-stats-manifest.json.gz" <<'NODE'
 const fs = require('fs');
 const zlib = require('zlib');
-for (const p of process.argv.slice(1)) {
+const paths = process.argv.slice(1).filter(p => p !== '-');
+for (const p of paths) {
   let raw = fs.readFileSync(p);
   if (p.endsWith('.gz')) raw = zlib.gunzipSync(raw);
   const j = JSON.parse(raw.toString('utf8'));
@@ -298,8 +348,11 @@ pass "Manifests parse as JSON"
 node - "${DOCS_DIR}/static-user-stats-manifest.json.gz" <<'NODE'
 const fs = require('fs');
 const zlib = require('zlib');
-let raw = fs.readFileSync(process.argv[1]);
-if (process.argv[1].endsWith('.gz')) raw = zlib.gunzipSync(raw);
+const args = process.argv.slice(1).filter(p => p !== '-');
+const path = args[0];
+if (!path) throw new Error('Missing manifest path');
+let raw = fs.readFileSync(path);
+if (path.endsWith('.gz')) raw = zlib.gunzipSync(raw);
 const m = JSON.parse(raw.toString('utf8'));
 if (!Array.isArray(m.shards) || m.shards.length === 0) throw new Error('user stats manifest missing shards');
 if (!Array.isArray(m.user_growth) || m.user_growth.length === 0) throw new Error('user stats manifest missing user_growth');

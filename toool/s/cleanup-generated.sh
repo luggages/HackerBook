@@ -48,7 +48,7 @@ confirm_rm() {
   pass "Deleted: ${target}"
 }
 
-log "🧹 Static News cleanup (generated assets)"
+log "🧹 HN Backup Tape cleanup (generated assets)"
 log "---------------------------------------"
 
 confirm_rm "${DOCS_DIR}/static-manifest.json"
