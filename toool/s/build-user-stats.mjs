@@ -437,19 +437,24 @@ async function main() {
     let userRows = 0;
     for (const user of userIter) {
       const uname = String(user.username || '');
-      if (!shardUserLo) shardUserLo = lowerName(uname);
-      shardUserHi = lowerName(uname);
+      const unameKey = lowerName(uname);
+      if (!shardUserLo) shardUserLo = unameKey;
+      shardUserHi = unameKey;
 
       userStmt.run(user);
       shardUsers += 1;
       userCountSinceCheck += 1;
 
-      while (domainRow && domainRow.username === uname) {
+      // Advance domain/month iterators in case collation differences leave them behind.
+      while (domainRow && lowerName(domainRow.username) < unameKey) domainRow = nextDomainRow();
+      while (monthRow && lowerName(monthRow.username) < unameKey) monthRow = nextMonthRow();
+
+      while (domainRow && lowerName(domainRow.username) === unameKey) {
         domainStmt.run(domainRow.username, domainRow.domain, domainRow.count);
         domainRow = nextDomainRow();
       }
 
-      while (monthRow && monthRow.username === uname) {
+      while (monthRow && lowerName(monthRow.username) === unameKey) {
         monthStmt.run(monthRow.username, monthRow.month, monthRow.count);
         monthRow = nextMonthRow();
       }
