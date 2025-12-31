@@ -2681,7 +2681,7 @@ function previewTitle(title = '', text = '', type = '', maxLen = 80) {
       renderRows(rows);
       statusEl.textContent = rows.length
         ? `${rows.length} item(s) on ${iso}`
-        : `No activity for ${iso}`;
+        : '';
       if (!statusHoldUntil || Date.now() >= statusHoldUntil) setStatus('');
     };
 
