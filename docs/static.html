@@ -1331,13 +1331,14 @@
         setStatus('');
         return;
       }
+      let shouldHoldNoItems = false;
 
       if (initialRoute && (view !== 'news' || page > 1)) {
         nav({ view: 'news', p: 1, warp: warpSid, warp_date: warpDate, id: null });
         return;
       }
       if ((warpDate || warpSid !== null) && (view !== 'news' || page > 1)) {
-        holdStatus(noItemsMsg, 2000);
+        shouldHoldNoItems = true;
       }
       if (listRetryKey !== retryKey) {
         listRetryKey = retryKey;
@@ -1356,11 +1357,7 @@
             listView(curView, curPage, curWarp, curWarpDate, token);
           }
         }, 250);
-        if (warpDate || warpSid !== null) {
-          holdStatus(noItemsMsg, 2000);
-        } else {
-          setStatus('Loading…');
-        }
+        setStatus('Loading…');
         return;
       }
       if (warpDate || warpSid !== null) {
@@ -1374,11 +1371,14 @@
             return;
           }
         }
-        holdStatus(noItemsMsg, 2000);
+        shouldHoldNoItems = true;
       }
       if (tableEl && tableEl.innerHTML && !tableEl.innerHTML.includes('Loading')) {
-        holdStatus(noItemsMsg, 2000);
+        shouldHoldNoItems = true;
         return;
+      }
+      if (shouldHoldNoItems) {
+        holdStatus(noItemsMsg, 2000);
       }
     } else {
       listRetryKey = null;
