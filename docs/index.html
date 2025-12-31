@@ -2884,10 +2884,10 @@
       if (headerDateEl) {
         headerDateEl.addEventListener('click', (e) => {
           e.preventDefault();
-          const warpVal = getWarpInputs()[0]?.value;
-          const warpTs = warpVal ? parseISODateUTC(warpVal, false) : null;
-          const warp = warpTs ? findShardForTs(warpTs)?.sid ?? null : null;
-          nav({ view: 'news', p: 1, warp, warp_date: warpVal || null, id: null });
+          const p = qs();
+          const warp = p.get('warp') ? parseInt(p.get('warp'), 10) : null;
+          const warpDate = p.get('warp_date') || null;
+          nav({ view: 'news', p: 1, warp, warp_date: warpDate, id: null });
         });
       }
 
