@@ -768,7 +768,7 @@
       lastWarpTs = targetTs;
       lastWarpSid = targetShard.sid;
       const current = qs().get('view') || 'news';
-      const view = ['news','newest','ask','show','jobs'].includes(current) ? current : 'news';
+      const view = ['news','newest','ask','show','jobs','me'].includes(current) ? current : 'news';
       const iso = formatISODateUTC(targetTs);
       setWarpInputs(iso);
       nav({ view, warp: targetShard.sid, warp_date: iso });
